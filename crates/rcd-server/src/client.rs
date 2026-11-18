@@ -167,3 +167,74 @@ pub async fn run_mcp_http(_config: Option<PathBuf>) -> Result<()> {
     ensure_daemon()?;
     crate::http::serve().await
 }
+
+/// Register this server with mcp2cli: named config + `rcd` link alias.
+/// After this, `rcd search-content --query ...` works as a native CLI verb
+/// (mcp2cli turns our MCP tools into typed --flag commands).
+pub async fn run_mcp2cli(
+    config_path: Option<PathBuf>,
+    transport: String,
+    endpoint: Option<String>,
+    force: bool,
+) -> Result<()> {
+    let mcp2cli = which_mcp2cli()
+        .ok_or_else(|| anyhow::anyhow!(
+            "mcp2cli not found on PATH — install it first: cargo install --git https://github.com/mcp2cli/source-code"
+        ))?;
+    let exe = std::env::current_exe()?;
+
+    let mut cmd = std::process::Command::new(&mcp2cli);
+    cmd.args(["config", "init", "--name", "rcd", "--app", "bridge"]);
+    match transport.as_str() {
+        "stdio" => {
+            // The bridge auto-spawns our daemon; stdio keeps it local-only.
+            cmd.args(["--transport", "stdio"]);
+            let exe_str = exe.to_string_lossy();
+            cmd.args(["--stdio-command", exe_str.as_ref()]);
+            cmd.args(["--stdio-arg", "mcp"]);
+        }
+        "http" => {
+            let url = endpoint.unwrap_or_else(|| {
+                let bind = rcd_core::config::Config::load(config_path.as_deref())
+                    .map(|c| c.server.http_bind.clone())
+                    .unwrap_or_else(|_| "127.0.0.1:8765".to_string());
+                format!("http://{bind}/mcp")
+            });
+            cmd.args(["--transport", "streamable_http"]);
+            cmd.args(["--endpoint", &url]);
+        }
+        other => anyhow::bail!("unknown transport {other:?} (use stdio or http)"),
+    }
+    if force {
+        cmd.arg("--force");
+    }
+    let status = cmd.status().context("running mcp2cli config init")?;
+    if !status.success() {
+        anyhow::bail!("mcp2cli config init failed (exit {status})");
+    }
+
+    // Activate and create the `rcd` command alias.
+    for args in [vec!["use", "rcd"], vec!["link", "create", "--name", "rcd"]] {
+        let status = std::process::Command::new(&mcp2cli)
+            .args(&args)
+            .status()
+            .with_context(|| format!("running mcp2cli {}", args.join(" ")))?;
+        if !status.success() {
+            anyhow::bail!("mcp2cli {} failed (exit {status})", args.join(" "));
+        }
+    }
+
+    println!("registered: mcp2cli config `rcd` + `rcd` link");
+    println!("try: rcd get-status          # daemon/index status");
+    println!("     rcd search-content --query \"混合检索\" --mode hybrid");
+    println!("     rcd save-note --title ... --body ...");
+    Ok(())
+}
+
+fn which_mcp2cli() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "mcp2cli.exe" } else { "mcp2cli" };
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}

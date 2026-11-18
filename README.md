@@ -61,6 +61,24 @@ claude mcp add rcd-search -- <repo>/target/release/rcd-mcp-server.exe mcp
     "args": ["mcp"] } } }
 ```
 
+### mcp2cli 模式（MCP 工具变原生 CLI 动词）
+
+内置 [mcp2cli](https://github.com/mcp2cli/source-code) 接入：一条命令把本 server 的 MCP 工具注册成原生 CLI（`search` → `search-content --query ...`，类型化 `--flags`、JSON 输出、可管道组合）。
+
+```bash
+# 前置：安装 mcp2cli（一次性）
+cargo install --git https://github.com/mcp2cli/source-code
+
+# 注册（stdio 桥，自动拉起 daemon；或 --transport http 走 HTTP 面板）
+rcd-mcp-server mcp2cli
+
+# 之后即得原生动词：
+rcd get-status
+rcd search-content --query "混合检索" --mode hybrid
+rcd save-note --title "..." --body "..."
+rcd record-feedback --note-id KB-... --helpful true
+```
+
 ### HTTP 模式
 
 ```bash

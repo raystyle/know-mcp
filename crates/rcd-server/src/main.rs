@@ -56,6 +56,19 @@ enum Command {
         #[command(subcommand)]
         action: NoteAction,
     },
+    /// Register this server with mcp2cli (named config + `rcd` CLI alias).
+    #[command(name = "mcp2cli")]
+    Mcp2Cli {
+        /// Transport for the binding: stdio bridge (default) or http.
+        #[arg(long, default_value = "stdio")]
+        transport: String,
+        /// HTTP endpoint when --transport http (default from config).
+        #[arg(long)]
+        endpoint: Option<String>,
+        /// Overwrite an existing named config.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -81,6 +94,9 @@ async fn main() -> Result<()> {
             client::run_search(cli.config, query, mode, top_k, path).await
         }
         Command::Note { action } => client::run_note(cli.config, action).await,
+        Command::Mcp2Cli { transport, endpoint, force } => {
+            client::run_mcp2cli(cli.config, transport, endpoint, force).await
+        }
     }
 }
 
