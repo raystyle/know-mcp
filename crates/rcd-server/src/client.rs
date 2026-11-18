@@ -168,7 +168,7 @@ pub async fn run_mcp_http(_config: Option<PathBuf>) -> Result<()> {
     crate::http::serve().await
 }
 
-/// Register this server with mcp2cli: named config + `rcd` link alias.
+/// Register this server with mcp2cli: named config + `rcd-cli` command alias.
 /// After this, `rcd search-content --query ...` works as a native CLI verb
 /// (mcp2cli turns our MCP tools into typed --flag commands).
 pub async fn run_mcp2cli(
@@ -184,7 +184,7 @@ pub async fn run_mcp2cli(
     let exe = std::env::current_exe()?;
 
     let mut cmd = std::process::Command::new(&mcp2cli);
-    cmd.args(["config", "init", "--name", "rcd", "--app", "bridge"]);
+    cmd.args(["config", "init", "--name", "rcd-cli", "--app", "bridge"]);
     match transport.as_str() {
         "stdio" => {
             // The bridge auto-spawns our daemon; stdio keeps it local-only.
@@ -214,7 +214,7 @@ pub async fn run_mcp2cli(
     }
 
     // Activate and create the `rcd` command alias.
-    for args in [vec!["use", "rcd"], vec!["link", "create", "--name", "rcd"]] {
+    for args in [vec!["use", "rcd-cli"], vec!["link", "create", "--name", "rcd-cli"]] {
         let status = std::process::Command::new(&mcp2cli)
             .args(&args)
             .status()
@@ -224,10 +224,10 @@ pub async fn run_mcp2cli(
         }
     }
 
-    println!("registered: mcp2cli config `rcd` + `rcd` link");
-    println!("try: rcd get-status          # daemon/index status");
-    println!("     rcd search-content --query \"混合检索\" --mode hybrid");
-    println!("     rcd save-note --title ... --body ...");
+    println!("registered: mcp2cli config `rcd-cli` + `rcd-cli` command");
+    println!("try: rcd-cli get-status          # daemon/index status");
+    println!("     rcd-cli search-content --query \"混合检索\" --mode hybrid");
+    println!("     rcd-cli save-note --title ... --body ...");
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-# rcd-mcp-server
+# rcd-mcp
 
 本地 daemon 形态的混合搜索 + 知识沉淀 MCP server。对归档的代码仓库、文档、逆向源码做**关键字 + 向量语义 + 混合搜索**，并提供带行号的文件读取与知识笔记闭环。
 
@@ -6,9 +6,9 @@
 
 ```
 ┌─ MCP 客户端 (Claude Code / Desktop / 其他)
-│    stdio 桥 (rcd-mcp-server mcp)          HTTP (rcd-mcp-server http → /mcp)
+│    stdio 桥 (rcd-mcp stdio)          HTTP (rcd-mcp http → /mcp)
 ▼
-┌─ daemon (rcd-mcp-server daemon, 后台常驻, 单实例)
+┌─ daemon (rcd-mcp daemon, 后台常驻, 单实例)
 │  ├─ JSON 管理面 (local socket: named pipe / UDS)
 │  ├─ zvec collection (HNSW 向量 + jieba FTS + 引擎级 RRF 混合)
 │  ├─ Qwen3-Embedding-0.6B ×2 (索引工作线程 + 查询线程, llama.cpp)
@@ -43,22 +43,22 @@
 ```bash
 cargo build --release
 cp rcd-mcp.toml.example rcd-mcp.toml   # 编辑：roots / 模型路径 / index_dir
-./target/release/rcd-mcp-server index   # 首次建索引（前台跑，看进度）
-./target/release/rcd-mcp-server search "hybrid search"  # 冒烟
+./target/release/rcd-mcp index   # 首次建索引（前台跑，看进度）
+./target/release/rcd-mcp search "hybrid search"  # 冒烟
 ```
 
 ### 接入 Claude Code
 
 ```bash
-claude mcp add rcd-search -- <repo>/target/release/rcd-mcp-server.exe mcp
+claude mcp add rcd-search -- <repo>/target/release/rcd-mcp.exe mcp
 ```
 
 或 `settings.json`：
 
 ```json
 { "mcpServers": { "rcd-search": {
-    "command": "<repo>/target/release/rcd-mcp-server",
-    "args": ["mcp"] } } }
+    "command": "<repo>/target/release/rcd-mcp",
+    "args": ["stdio"] } } }
 ```
 
 ### mcp2cli 模式（MCP 工具变原生 CLI 动词）
@@ -70,29 +70,29 @@ claude mcp add rcd-search -- <repo>/target/release/rcd-mcp-server.exe mcp
 cargo install --git https://github.com/mcp2cli/source-code
 
 # 注册（stdio 桥，自动拉起 daemon；或 --transport http 走 HTTP 面板）
-rcd-mcp-server register-cli
+rcd-mcp register
 
-# 之后即得原生动词：
-rcd get-status
-rcd search-content --query "混合检索" --mode hybrid
-rcd save-note --title "..." --body "..."
-rcd record-feedback --note-id KB-... --helpful true
+# 之后即得 `rcd-cli` 原生动词：
+rcd-cli get-status
+rcd-cli search-content --query "混合检索" --mode hybrid
+rcd-cli save-note --title "..." --body "..."
+rcd-cli record-feedback --note-id KB-... --helpful true
 ```
 
 ### HTTP 模式
 
 ```bash
-rcd-mcp-server http    # http://127.0.0.1:8765/mcp（挂 daemon）
+rcd-mcp http    # http://127.0.0.1:8765/mcp（挂 daemon）
 ```
 
 ### CLI 调试
 
 ```
-rcd-mcp-server status         # 自动拉起 daemon 并回报
-rcd-mcp-server search "混合检索" --mode auto
-rcd-mcp-server index --force  # 全量重嵌入
-rcd-mcp-server note list|show <id>
-rcd-mcp-server stop
+rcd-mcp status         # 自动拉起 daemon 并回报
+rcd-mcp search "混合检索" --mode auto
+rcd-mcp index --force  # 全量重嵌入
+rcd-mcp note list|show <id>
+rcd-mcp stop
 ```
 
 ## 配置（rcd-mcp.toml）
@@ -105,7 +105,7 @@ rcd-mcp-server stop
 - daemon 日志：`%APPDATA%\rcd-mcp\daemon.log`（Windows）或 index_dir 下 `daemon.log`
 - socket：named pipe / UDS `rcd-mcp.sock`（`RCD_SOCKET_PATH` 可覆盖）
 - 索引数据：配置的 `index_dir`（collection + meta.json + sync_state.json + feedback.json）
-- 单实例：socket bind 即互斥；陈旧 socket 自动检测重建；`rcd-mcp-server stop` 优雅停机
+- 单实例：socket bind 即互斥；陈旧 socket 自动检测重建；`rcd-mcp stop` 优雅停机
 - 知识笔记：配置的 `notes.dir`（人可读 markdown，建议进 git）
 
 ## 构建依赖

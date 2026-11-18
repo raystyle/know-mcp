@@ -1,4 +1,4 @@
-//! rcd-mcp-server: local daemon MCP server for hybrid search over archived
+//! rcd-mcp: local daemon MCP server for hybrid search over archived
 //! code and documents.
 
 mod daemon;
@@ -10,7 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "rcd-mcp-server", version, about = "Hybrid search MCP over archived code and documents")]
+#[command(name = "rcd-mcp", version, about = "Hybrid search MCP over archived code and documents")]
 struct Cli {
     /// Path to rcd-mcp.toml (default: RCD_MCP_CONFIG env or exe-adjacent).
     #[arg(long, global = true)]
@@ -25,6 +25,7 @@ enum Command {
     /// Run the background daemon explicitly (normally auto-spawned).
     Daemon,
     /// MCP over stdio (Claude Code entry point; bridges to the daemon).
+    #[command(name = "stdio")]
     Mcp,
     /// MCP over streamable HTTP (served by the daemon).
     Http,
@@ -56,8 +57,8 @@ enum Command {
         #[command(subcommand)]
         action: NoteAction,
     },
-    /// Register this server as a native CLI (mcp2cli binding + `rcd` alias).
-    #[command(name = "register-cli")]
+    /// Register this server as a native CLI: `rcd-cli` (via mcp2cli binding).
+    #[command(name = "register")]
     Mcp2Cli {
         /// Transport for the binding: stdio bridge (default) or http.
         #[arg(long, default_value = "stdio")]

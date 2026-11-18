@@ -311,7 +311,7 @@ impl ServerHandler for RcdMcpServer {
     }
 }
 
-/// Serve MCP over stdio (called from `rcd-mcp-server mcp`).
+/// Serve MCP over stdio (called from `rcd-mcp mcp`).
 pub async fn serve_stdio() -> anyhow::Result<()> {
     // Logs to stderr only; stdout carries MCP.
     tracing_subscriber::fmt()

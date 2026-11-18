@@ -6,7 +6,7 @@ license.workspace = true
 description = "Local daemon MCP server for hybrid search over archived code and documents"
 
 [[bin]]
-name = "rcd-mcp-server"
+name = "rcd-mcp"
 path = "src/main.rs"
 
 [dependencies]
