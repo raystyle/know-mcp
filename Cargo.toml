@@ -18,13 +18,18 @@ sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal", "time", "sync"] }
 
-[workspace.metadata.dylint]
-libraries = [
-    { path = "lints/rcd_lints" },
-]
 
 [profile.dev]
 debug = 0
 
 [profile.release]
 lto = "thin"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unused = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+correctness = "deny"
+perf = "warn"

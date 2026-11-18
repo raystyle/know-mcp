@@ -1,0 +1,15 @@
+# Project-specific Clippy configuration — runs with every `cargo clippy`.
+# These replace the equivalent rcd-lint rules (name-based bans need no
+# custom code). Co-occurrence rules that Clippy cannot express stay in
+# lints/rcd-lint.
+
+disallowed-methods = [
+    # Bug history: embeddings_ith returned per-token rows and produced
+    # all-zero embeddings under pooling=LAST. Use embeddings_seq_ith.
+    { path = "llama_cpp_2::context::LlamaContext::embeddings_ith", reason = "use embeddings_seq_ith — per-token rows are empty under pooling (all-zero embeddings bug)" },
+    # zvec: delete_by_filter throws when nothing matches.
+    { path = "zvec_rust::collection::Collection::delete_by_filter", reason = "throws on no-match; use deterministic pks + delete()" },
+    # zvec: optimize is fragile on some volumes (Parquet footer errors) —
+    # only the explicit --optimize path may call it.
+    { path = "zvec_rust::collection::Collection::optimize", reason = "fragile on some volumes; only the explicit opt-in path may call it" },
+]

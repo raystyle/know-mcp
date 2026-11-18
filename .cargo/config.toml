@@ -1,0 +1,4 @@
+# Install as .cargo/config.toml (kept out of the repo root to avoid
+# surprising contributors' local settings).
+[alias]
+lint = "clippy --all-targets -- -D warnings --no-deps"

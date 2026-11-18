@@ -105,6 +105,9 @@ rcd-mcp-server stop
 ```bash
 cargo test -p rcd-core   # 单测 + zvec 集成测试（嵌入冒烟需本地模型文件，缺失自动跳过）
 cargo build              # 全量构建
+bash scripts/build.sh lint   # clippy + 项目禁令（clippy.toml）
 ```
 
 测试覆盖：分块器（中英文/代码栅栏/超长行）、zvec 存储三模式检索、笔记读写往返、嵌入相似度结构与吞吐下限。
+
+项目专属 Lint：`clippy.toml` 的 `disallowed-methods` 禁用踩过坑的 API（embeddings_ith / delete_by_filter / optimize），随 `cargo clippy` 一起跑。

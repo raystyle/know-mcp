@@ -32,3 +32,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "std", "fmt"] 
 
 [build-dependencies]
 zvec-rust-build = "0.8.1"
+
+[lints]
+workspace = true

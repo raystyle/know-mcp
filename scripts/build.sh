@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
-# One-shot build wrapper: stable env + debug/release switch.
+# rcd-mcp-server build & lint workflow (three tiers).
+#   rustc + clippy : cargo lint            (fast, everyday)
 set -e
 cd "$(dirname "$0")/.."
 source scripts/env.sh
-case "${1:-debug}" in
-  debug) cargo build ;;
-  release) cargo build --release ;;
-  lint) cargo dylint --all ;;
-  *) echo "usage: build.sh [debug|release|lint]" >&2; exit 2 ;;
+
+case "${1:-build}" in
+  build)
+    cargo build "${@:2}"
+    ;;
+  release)
+    cargo build --release
+    ;;
+  lint)      # clippy + project bans (clippy.toml disallowed-methods)
+    cargo clippy --all-targets -- -D warnings --no-deps
+    ;;
+  test)
+    cargo test -p rcd-core
+    ;;
+  *)
+    echo "usage: build.sh [build|release|lint|test]" >&2
+    exit 2
+    ;;
 esac
