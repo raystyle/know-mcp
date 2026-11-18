@@ -1,4 +1,5 @@
-//! rcd-core: hybrid keyword+vector search over archived code and documents.
+//! rcd-core — Reference Code & Documentation: hybrid keyword+vector search
+//! core over archived reference code and documentation.
 //!
 //! Two resource kinds share one index:
 //! - `archive` (read-only facts): cloned repos, docs, reverse-engineered sources

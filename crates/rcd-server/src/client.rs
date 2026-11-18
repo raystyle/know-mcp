@@ -2,17 +2,25 @@
 //! to the daemon's JSON management plane over the local socket.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{GenericNamespaced, Stream};
+use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream};
+use interprocess::ConnectWaitMode;
 use serde_json::{json, Value};
 
 use crate::daemon::{ensure_daemon, is_daemon_listening, socket_name};
 
 fn connect() -> Result<Stream> {
+    // Time-bounded connect: a busy daemon pipe errors fast instead of
+    // hanging forever (unbounded wait was the CLI-hang bug).
     let name = socket_name().to_ns_name::<GenericNamespaced>()?;
-    Stream::connect(name).context("connecting to daemon socket")
+    ConnectOptions::new()
+        .name(name)
+        .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(5)))
+        .connect_sync()
+        .context("connecting to daemon socket (is the daemon busy or down?)")
 }
 
 /// Send one request, read one response line.
@@ -29,8 +37,8 @@ pub fn admin_request(method: &str, params: Value) -> Result<Value> {
     Ok(response)
 }
 
-pub async fn run_status(_config: Option<PathBuf>) -> Result<()> {
-    ensure_daemon()?;
+pub async fn run_status(config: Option<PathBuf>) -> Result<()> {
+    ensure_daemon(config.as_deref())?;
     let response = admin_request("status", json!({}))?;
     println!("{}", serde_json::to_string_pretty(&response["result"])?);
     Ok(())
@@ -95,13 +103,13 @@ pub async fn run_index(config: Option<PathBuf>, force: bool, optimize: bool) -> 
 }
 
 pub async fn run_search(
-    _config: Option<PathBuf>,
+    config: Option<PathBuf>,
     query: String,
     mode: String,
     top_k: usize,
     path: Option<String>,
 ) -> Result<()> {
-    ensure_daemon()?;
+    ensure_daemon(config.as_deref())?;
     let params = json!({
         "query": query,
         "mode": mode,
@@ -136,8 +144,8 @@ pub async fn run_search(
     Ok(())
 }
 
-pub async fn run_note(_config: Option<PathBuf>, action: crate::NoteAction) -> Result<()> {
-    ensure_daemon()?;
+pub async fn run_note(config: Option<PathBuf>, action: crate::NoteAction) -> Result<()> {
+    ensure_daemon(config.as_deref())?;
     match action {
         crate::NoteAction::List => {
             let response = admin_request("list_notes", json!({}))?;
@@ -156,16 +164,16 @@ pub async fn run_note(_config: Option<PathBuf>, action: crate::NoteAction) -> Re
 
 /// MCP stdio bridge: speak MCP on stdin/stdout, forward tool calls to the
 /// daemon's admin plane.
-pub async fn run_mcp_stdio(_config: Option<PathBuf>) -> Result<()> {
-    ensure_daemon()?;
-    crate::mcp::serve_stdio().await
+pub async fn run_mcp_stdio(config: Option<PathBuf>) -> Result<()> {
+    ensure_daemon(config.as_deref())?;
+    crate::mcp::serve_stdio(config).await
 }
 
 /// MCP HTTP bridge: ensure daemon, then serve streamable HTTP locally,
 /// forwarding tool calls to the daemon.
-pub async fn run_mcp_http(_config: Option<PathBuf>) -> Result<()> {
-    ensure_daemon()?;
-    crate::http::serve().await
+pub async fn run_mcp_http(config: Option<PathBuf>) -> Result<()> {
+    ensure_daemon(config.as_deref())?;
+    crate::http::serve(config).await
 }
 
 /// Register this server with mcp2cli: named config + `rcd-cli` command alias.

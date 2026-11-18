@@ -1,5 +1,5 @@
-//! rcd-mcp: local daemon MCP server for hybrid search over archived
-//! code and documents.
+//! rcd-mcp — Reference Code & Documentation: local daemon MCP server for
+//! hybrid search over archived reference code and documentation.
 
 mod daemon;
 mod client;

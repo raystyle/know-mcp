@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Smoke test: full-stack verification against a tiny fixture corpus.
+# Requires: built binary + a real GGUF model (config gguf_path) + zvec DLLs.
+# Usage: bash tests/smoke.sh [--release]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+source scripts/env.sh
+
+BIN="${1:---debug}"
+case "$BIN" in
+  --release) EXE=target/release/rcd-mcp ;;
+  *) EXE=target/debug/rcd-mcp ;;
+esac
+[[ -f "$EXE" ]] || { echo "FAIL: $EXE not built" >&2; exit 1; }
+
+# Isolated environment: own config, own socket, own index dir.
+SMOKE="$(cygpath -m "${TEMP:-/c/Windows/Temp}")/rcd-smoke-$$"
+mkdir -p "$SMOKE"
+trap 'rm -rf "$SMOKE"; "$EXE" --config "$SMOKE/rcd-mcp.toml" stop >/dev/null 2>&1 || true' EXIT
+export RCD_SOCKET_PATH="rcd-mcp-smoke-$RANDOM"
+FIXTURE="$SMOKE/corpus"
+mkdir -p "$FIXTURE/code" "$FIXTURE/docs" "$FIXTURE/knowledge"
+
+cat > "$FIXTURE/code/zvec_probe.rs" <<'EOF'
+pub fn zvec_hybrid_probe() -> &'static str {
+    "ZVecInitialize multi_query set_rerank_rrf hybrid search"
+}
+EOF
+cat > "$FIXTURE/docs/hybrid.md" <<'EOF'
+# 混合检索方案
+混合检索融合 BM25 关键字与向量语义，RRF 排序融合。
+EOF
+
+MODEL=$(python -c "import tomllib;print(tomllib.load(open('rcd-mcp.toml','rb'))['embed']['gguf_path'])" 2>/dev/null || true)
+cat > "$SMOKE/rcd-mcp.toml" <<EOF
+[index]
+roots = ["$FIXTURE/code", "$FIXTURE/docs"]
+[notes]
+dir = "$FIXTURE/knowledge"
+[embed]
+model = "qwen3-embedding-0.6b"
+gguf_path = "$MODEL"
+tokenizer_repo = "Qwen/Qwen3-Embedding-0.6B"
+[storage]
+index_dir = "$SMOKE/index"
+[server]
+http_bind = "127.0.0.1:18765"
+EOF
+
+CONFIG_ARGS=(--config "$SMOKE/rcd-mcp.toml")
+
+pass() { echo "PASS: $1"; }
+fail() { echo "FAIL: $1" >&2; exit 1; }
+
+# 1. Index the fixture (foreground, no daemon yet).
+"$EXE" "${CONFIG_ARGS[@]}" index || fail "index run"
+[[ -d "$SMOKE/index/collection" ]] || fail "collection dir created"
+
+# 2. Daemon up + status answers.
+"$EXE" "${CONFIG_ARGS[@]}" status >/dev/null || fail "daemon auto-spawn"
+
+# 3. Identifier search hits the Rust file.
+"$EXE" "${CONFIG_ARGS[@]}" search "ZVecInitialize" --mode keyword | grep -q "zvec_probe" \
+  || fail "identifier keyword search"
+
+# 4. Chinese search hits the doc (jieba).
+"$EXE" "${CONFIG_ARGS[@]}" search "混合检索" --mode keyword | grep -q "hybrid" \
+  || fail "chinese keyword search"
+
+# 5. Hybrid mode works end-to-end (embeds the query).
+"$EXE" "${CONFIG_ARGS[@]}" search "hybrid search 关键字" --mode hybrid | grep -qE "zvec_probe|hybrid" \
+  || fail "hybrid search"
+
+# 6. Incremental second pass is unchanged (fast path).
+OUT=$("$EXE" "${CONFIG_ARGS[@]}" index 2>/dev/null | grep -o "unchanged" | head -1)
+[[ -n "$OUT" ]] || fail "incremental second pass reports unchanged"
+
+pass "smoke: all checks"

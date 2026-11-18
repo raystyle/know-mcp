@@ -6,13 +6,14 @@ use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
-pub async fn serve() -> anyhow::Result<()> {
-    let config = rcd_core::config::Config::load(None)?;
+pub async fn serve(config_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
+    let config = rcd_core::config::Config::load(config_path.as_deref())?;
     let bind = config.server.http_bind.clone();
     drop(config);
 
+    let config_path = config_path.clone();
     let service = StreamableHttpService::new(
-        || Ok(crate::mcp::RcdMcpServer::new()),
+        move || Ok(crate::mcp::RcdMcpServer::with_config_path(config_path.clone())),
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );

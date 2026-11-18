@@ -105,11 +105,16 @@ pub struct GetGapsArgs {
 #[derive(Clone)]
 pub struct RcdMcpServer {
     tool_router: ToolRouter<RcdMcpServer>,
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl RcdMcpServer {
     pub fn new() -> Self {
-        Self { tool_router: Self::tool_router() }
+        Self { tool_router: Self::tool_router(), config_path: None }
+    }
+
+    pub fn with_config_path(config_path: Option<std::path::PathBuf>) -> Self {
+        Self { tool_router: Self::tool_router(), config_path }
     }
 }
 
@@ -146,7 +151,7 @@ impl RcdMcpServer {
         })?;
 
         // Root allowlist guard: canonical path must sit under a configured root.
-        let config = rcd_core::config::Config::load(None).map_err(|e| {
+        let config = rcd_core::config::Config::load(self.config_path.as_deref()).map_err(|e| {
             McpError::internal_error(format!("loading config: {e}"), None)
         })?;
         let allowed = config
@@ -312,7 +317,7 @@ impl ServerHandler for RcdMcpServer {
 }
 
 /// Serve MCP over stdio (called from `rcd-mcp mcp`).
-pub async fn serve_stdio() -> anyhow::Result<()> {
+pub async fn serve_stdio(config_path: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     // Logs to stderr only; stdout carries MCP.
     tracing_subscriber::fmt()
         .with_env_filter(

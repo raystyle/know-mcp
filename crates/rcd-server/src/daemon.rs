@@ -5,6 +5,7 @@
 //! MCP rides the stdio bridge or HTTP on top.
 
 use std::path::PathBuf;
+use std::time::Duration;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -36,29 +37,37 @@ fn ns_name() -> Result<interprocess::local_socket::Name<'static>> {
     socket_name().to_ns_name::<GenericNamespaced>().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Probe: is a daemon already listening?
+/// Probe: is a daemon already listening? Time-bounded — never hangs.
 pub fn is_daemon_listening() -> bool {
-    match ns_name() {
-        Ok(name) => Stream::connect(name).is_ok(),
-        Err(_) => false,
-    }
+    use interprocess::local_socket::ConnectOptions;
+    let Ok(name) = ns_name() else { return false };
+    ConnectOptions::new()
+        .name(name)
+        .wait_mode(interprocess::ConnectWaitMode::Timeout(
+            Duration::from_secs(2),
+        ))
+        .connect_sync()
+        .is_ok()
 }
 
 /// Ensure a daemon is running: probe, then spawn detached, then wait for
 /// readiness. Returns when the daemon accepts connections.
-pub fn ensure_daemon() -> Result<()> {
+pub fn ensure_daemon(config_path: Option<&std::path::Path>) -> Result<()> {
     if is_daemon_listening() {
         return Ok(());
     }
-    spawn_daemon_detached().context("spawning daemon")?;
+    spawn_daemon_detached(config_path).context("spawning daemon")?;
     wait_for_ready().context("waiting for daemon readiness")
 }
 
-fn spawn_daemon_detached() -> Result<()> {
+fn spawn_daemon_detached(config_path: Option<&std::path::Path>) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current exe")?;
     let mut command = std::process::Command::new(&exe);
+    command.arg("daemon");
+    if let Some(path) = config_path {
+        command.arg("--config").arg(path);
+    }
     command
-        .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -217,17 +226,28 @@ fn serve_connection(stream: Stream, state: &Arc<DaemonState>) -> Result<()> {
         let Ok(request) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        let reply = handle_admin(request, state);
-        if let Some(payload) = reply {
-            writeln!(writer, "{payload}")?;
-            writer.flush()?;
-        }
+        let reply = handle_admin(request, state).unwrap_or_else(|| {
+            json!({"id": Value::Null, "error": "unhandled or malformed request"}).to_string()
+        });
+        writeln!(writer, "{reply}")?;
+        writer.flush()?;
     }
 }
 
 fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
     let method = request.get("method")?.as_str()?.to_string();
     let id = request.get("id").cloned();
+    // Params live under "params" (JSON-RPC style); top-level fields are a
+    // legacy fallback. Without this, `params.get("query")?` silently
+    // returned None and the client hung forever waiting for a reply.
+    let params = request.get("params").cloned().unwrap_or_else(|| {
+        let mut top = request.clone();
+        top.as_object_mut().map(|m| {
+            m.remove("method");
+            m.remove("id");
+        });
+        top
+    });
     let result = match method.as_str() {
         "status" => Ok(status_json(state)),
         "stop" => {
@@ -240,19 +260,19 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
             Ok(json!({"stopping": true}))
         }
         "reindex" => {
-            let force = request.get("force").and_then(|f| f.as_bool()).unwrap_or(false);
+            let force = params.get("force").and_then(|f| f.as_bool()).unwrap_or(false);
             spawn_reindex_task(state.clone(), force);
             Ok(json!({"started": true}))
         }
         "search" => {
-            let query = request.get("query")?.as_str()?.to_string();
-            let mode = request.get("mode").and_then(|m| m.as_str()).and_then(parse_mode);
-            let top_k = request.get("top_k").and_then(|k| k.as_u64()).unwrap_or(10) as usize;
+            let query = params.get("query")?.as_str()?.to_string();
+            let mode = params.get("mode").and_then(|m| m.as_str()).and_then(parse_mode);
+            let top_k = params.get("top_k").and_then(|k| k.as_u64()).unwrap_or(10) as usize;
             let path_filter = request
                 .get("path_filter")
                 .and_then(|p| p.as_str())
                 .map(|s| s.to_string());
-            let kind = request.get("kind_filter").and_then(|k| k.as_str()).and_then(parse_kind);
+            let kind = params.get("kind_filter").and_then(|k| k.as_str()).and_then(parse_kind);
             let mut embedder = state.query_embedder.lock().ok()?;
             let mut svc = SearchService {
                 store: state.store.as_ref(),
@@ -263,8 +283,8 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
                 .map(|r| serde_json::to_value(&r).unwrap_or_default())
         }
         "save_note" => {
-            let title = request.get("title")?.as_str()?.to_string();
-            let body = request.get("body")?.as_str()?.to_string();
+            let title = params.get("title")?.as_str()?.to_string();
+            let body = params.get("body")?.as_str()?.to_string();
             let tags = request
                 .get("tags")
                 .and_then(|t| t.as_array())
@@ -275,7 +295,7 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
                 .and_then(|t| t.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<_>>())
                 .unwrap_or_default();
-            let query = request.get("query").and_then(|q| q.as_str()).map(|s| s.to_string());
+            let query = params.get("query").and_then(|q| q.as_str()).map(|s| s.to_string());
             state
                 .notes
                 .save(&title, &body, &tags, &sources, query.as_deref())
@@ -283,8 +303,8 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         "list_notes" => {
-            let tag = request.get("tag").and_then(|t| t.as_str());
-            let limit = request.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
+            let tag = params.get("tag").and_then(|t| t.as_str());
+            let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
             let stats = state.feedback.note_stats();
             state
                 .notes
@@ -309,7 +329,7 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         "get_note" => {
-            let note_id = request.get("id")?.as_str()?.to_string();
+            let note_id = params.get("id")?.as_str()?.to_string();
             state
                 .notes
                 .get(&note_id)
@@ -321,9 +341,9 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         "record_feedback" => {
-            let note_id = request.get("note_id")?.as_str()?.to_string();
-            let helpful = request.get("helpful")?.as_bool()?;
-            let comment = request.get("comment").and_then(|c| c.as_str());
+            let note_id = params.get("note_id")?.as_str()?.to_string();
+            let helpful = params.get("helpful")?.as_bool()?;
+            let comment = params.get("comment").and_then(|c| c.as_str());
             state
                 .feedback
                 .record(&note_id, helpful, comment)
@@ -331,7 +351,7 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
                 .map_err(|e| anyhow::anyhow!("{e}"))
         }
         "get_gaps" => {
-            let limit = request.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
+            let limit = params.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
             Ok(json!(state.feedback.gaps(limit)))
         }
         other => Err(anyhow::anyhow!("unknown method: {other}")),
