@@ -56,8 +56,8 @@ enum Command {
         #[command(subcommand)]
         action: NoteAction,
     },
-    /// Register this server with mcp2cli (named config + `rcd` CLI alias).
-    #[command(name = "mcp2cli")]
+    /// Register this server as a native CLI (mcp2cli binding + `rcd` alias).
+    #[command(name = "register-cli")]
     Mcp2Cli {
         /// Transport for the binding: stdio bridge (default) or http.
         #[arg(long, default_value = "stdio")]

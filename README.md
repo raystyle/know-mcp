@@ -70,7 +70,7 @@ claude mcp add rcd-search -- <repo>/target/release/rcd-mcp-server.exe mcp
 cargo install --git https://github.com/mcp2cli/source-code
 
 # 注册（stdio 桥，自动拉起 daemon；或 --transport http 走 HTTP 面板）
-rcd-mcp-server mcp2cli
+rcd-mcp-server register-cli
 
 # 之后即得原生动词：
 rcd get-status
