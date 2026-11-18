@@ -146,14 +146,10 @@ pub async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
     }
 
     let store = Arc::new(ZvecStore::open(&config.storage.index_dir)?);
-    let embedder = std::sync::Mutex::new(QwenEmbedder::load(
-        &config.embed.gguf_path,
-        &config.embed.tokenizer_repo,
-    )?);
-    let query_embedder = std::sync::Mutex::new(QwenEmbedder::load(
-        &config.embed.gguf_path,
-        &config.embed.tokenizer_repo,
-    )?);
+    let gpu = config.embed.gpu_layers;
+    let gguf = &config.embed.gguf_path;
+    let embedder = std::sync::Mutex::new(QwenEmbedder::load_with_gpu_layers(gguf, gpu)?);
+    let query_embedder = std::sync::Mutex::new(QwenEmbedder::load_with_gpu_layers(gguf, gpu)?);
     let feedback = Feedback::load(&config.storage.index_dir)?;
     let notes = Notes::new(&config.notes.dir)?;
 

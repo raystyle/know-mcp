@@ -85,8 +85,8 @@ pub async fn run_index(config: Option<PathBuf>, force: bool, optimize: bool) -> 
     )?;
     eprintln!();
     println!(
-        "indexed: {} scanned, {} updated, {} unchanged, {} deleted, {} failed",
-        outcome.scanned, outcome.updated, outcome.unchanged, outcome.deleted, outcome.failed
+        "indexed: {} scanned, {} updated, {} unchanged, {} deleted, {} failed, {} binary-skipped",
+        outcome.scanned, outcome.updated, outcome.unchanged, outcome.deleted, outcome.failed, outcome.skipped_binary
     );
     if optimize {
         store.optimize().context("zvec optimize (known to be fragile on some volumes)")?;

@@ -3,3 +3,5 @@ target/
 .rcd-index/
 knowledge/
 rcd-mcp.toml
+vendor/dlls/
+lints/target/

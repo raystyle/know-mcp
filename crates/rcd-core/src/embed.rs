@@ -76,16 +76,32 @@ fn backend() -> &'static LlamaBackend {
 }
 
 impl QwenEmbedder {
+    /// Whether a CUDA GPU backend is available. A CUDA-compiled binary on a
+    /// machine without NVIDIA drivers simply sees no CUDA device here and
+    /// stays on CPU — no configuration needed for either side.
+    pub fn gpu_available() -> bool {
+        llama_cpp_2::list_llama_ggml_backend_devices()
+            .iter()
+            .any(|d| d.backend.eq_ignore_ascii_case("CUDA"))
+    }
+
     pub fn load(gguf_path: &Path, _tokenizer_repo: &str) -> Result<Self> {
+        Self::load_with_gpu_layers(gguf_path, None)
+    }
+
+    /// Load with an explicit GPU layer override; `None` = auto (all layers
+    /// when a CUDA device exists, 0 otherwise).
+    pub fn load_with_gpu_layers(gguf_path: &Path, gpu_layers: Option<u32>) -> Result<Self> {
         validate_gguf(gguf_path)?;
         let backend = backend();
-
+        let auto = if Self::gpu_available() { 999 } else { 0 };
+        let n_gpu_layers = gpu_layers.unwrap_or(auto);
         let model = LlamaModel::load_from_file(
             backend,
             gguf_path,
-            &LlamaModelParams::default(), // CPU defaults
+            &LlamaModelParams::default().with_n_gpu_layers(n_gpu_layers),
         )
-        .with_context(|| "loading GGUF weights (llama.cpp)")?;
+        .with_context(|| format!("loading GGUF weights (llama.cpp, n_gpu_layers={n_gpu_layers})"))?;
 
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get() as i32)

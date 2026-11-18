@@ -80,6 +80,8 @@ pub struct IndexOutcome {
     pub unchanged: usize,
     pub deleted: usize,
     pub failed: usize,
+    /// Binary-looking files skipped by content sniffing (not failures).
+    pub skipped_binary: usize,
 }
 
 /// meta.json: embedding fingerprint guard; mismatch → caller rebuilds.
@@ -137,7 +139,7 @@ pub fn run_incremental_index(
     let files = collect_files(config)?;
     let chunk_params = ChunkParams::new(config.chunk.chars, config.chunk.overlap);
 
-    let mut outcome = IndexOutcome { scanned: 0, updated: 0, unchanged: 0, deleted: 0, failed: 0 };
+    let mut outcome = IndexOutcome { scanned: 0, updated: 0, unchanged: 0, deleted: 0, failed: 0, skipped_binary: 0 };
     let mut report = |progress: Option<&dyn Fn(IndexProgress)>, scanned: usize, outcome: &IndexOutcome| {
         if let Some(cb) = progress {
             cb(IndexProgress {
@@ -218,11 +220,21 @@ pub fn run_incremental_index(
             outcome.failed += 1;
             continue;
         };
-        let text = match String::from_utf8(raw) {
+        // Text detection, layer 3: files with a whitelisted extension can
+        // still be binary (renamed blobs, corrupt files). Sniff NUL bytes
+        // in the first 8KB — the classic heuristic — before UTF-8 decoding.
+        let head = &raw[..raw.len().min(8192)];
+        if head.contains(&0u8) {
+            outcome.skipped_binary += 1;
+            continue;
+        }
+        // Strip a UTF-8 BOM so it never leaks into chunks/embeddings.
+        let raw = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) { &raw[3..] } else { &raw[..] };
+        let text = match String::from_utf8(raw.to_vec()) {
             Ok(t) => t,
             Err(_) => {
-                // Skip non-UTF8 files silently (binaries with known ext).
-                outcome.failed += 1;
+                // Non-UTF8 with a text extension: treat as binary, not failure.
+                outcome.skipped_binary += 1;
                 continue;
             }
         };

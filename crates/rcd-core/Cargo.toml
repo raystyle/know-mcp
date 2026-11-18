@@ -7,7 +7,7 @@ description = "Hybrid keyword+vector search core for archived code and documents
 
 [dependencies]
 zvec-rust = "0.8.1"
-llama-cpp-2 = "0.1.161"
+llama-cpp-2 = { version = "0.1.161", features = ["cuda-no-vmm"] }
 ignore = "0.4"
 dunce = "1"
 tokio = { workspace = true }

@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = ["rcd_lints"]
+
+[workspace.metadata.dylint.libraries]
+path = "rcd_lints"

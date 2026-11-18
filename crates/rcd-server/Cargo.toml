@@ -17,6 +17,7 @@ zvec-rust-build = "0.8.1"
 interprocess = { version = "2", features = ["tokio"] }
 futures-lite = "2"
 dunce = "1"
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_Foundation"] }
 chrono = { workspace = true }
 libc = "0.2"
 axum = "0.8"

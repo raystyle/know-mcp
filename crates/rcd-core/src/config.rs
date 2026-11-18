@@ -123,6 +123,9 @@ pub struct EmbedConfig {
     /// HF repo id or a local directory containing tokenizer.json.
     pub tokenizer_repo: String,
     pub max_batch_tokens: usize,
+    /// GPU layer offload. null/absent = auto (all layers when a CUDA device
+    /// is detected, CPU otherwise); 0 = force CPU; N = first N layers.
+    pub gpu_layers: Option<u32>,
 }
 
 impl Default for EmbedConfig {
@@ -134,6 +137,7 @@ impl Default for EmbedConfig {
             ),
             tokenizer_repo: "Qwen/Qwen3-Embedding-0.6B".to_string(),
             max_batch_tokens: 8192,
+            gpu_layers: None,
         }
     }
 }
