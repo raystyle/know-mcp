@@ -63,7 +63,8 @@ T0=$(now_ms)
 "$EXE" "${CFG[@]}" index >/dev/null 2>&1
 T1=$(now_ms)
 FULL_MS=$((T1 - T0))
-echo "index.full:        ${N_FILES} files in ${FULL_MS}ms  ($(( N_FILES * 1000 / (FULL_MS + 1) )) files/s)"
+RATE=$(awk "BEGIN{printf \"%.1f\", ${N_FILES} * 1000 / (${FULL_MS} + 1)}")
+echo "index.full:        ${N_FILES} files in ${FULL_MS}ms  (${RATE} files/s)"
 
 # --- 2. Incremental re-pass (all unchanged) ----------------------------
 T0=$(now_ms)
@@ -72,7 +73,7 @@ T1=$(now_ms)
 echo "index.incremental: $((T1 - T0))ms"
 
 # --- 3. Query latency (10 samples each) --------------------------------
-"$EXE" "${CFG[@]}" status >/dev/null 2>&1   # daemon up
+"$EXE" "${CFG[@]}" status >/dev/null 2>&1   # daemon up (same RCD_SOCKET_PATH)
 bench_query() { # bench_query <label> <mode> <query>
   local label=$1 mode=$2 query=$3
   local times=() t0 t1
