@@ -1,0 +1,28 @@
+//! Streamable HTTP MCP transport (v1: served by a light bridge process that
+//! forwards to the daemon; the daemon itself stays the single owner of the
+//! index).
+
+use rmcp::transport::streamable_http_server::{
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+};
+
+pub async fn serve() -> anyhow::Result<()> {
+    let config = rcd_core::config::Config::load(None)?;
+    let bind = config.server.http_bind.clone();
+    drop(config);
+
+    let service = StreamableHttpService::new(
+        || Ok(crate::mcp::RcdMcpServer::new()),
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default(),
+    );
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    eprintln!("MCP streamable HTTP listening on http://{bind}/mcp");
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    Ok(())
+}

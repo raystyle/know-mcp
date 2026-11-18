@@ -1,0 +1,5 @@
+target/
+*.log
+.rcd-index/
+knowledge/
+rcd-mcp.toml
