@@ -149,6 +149,7 @@ enum StoreMsg {
     Dropped(String, u32),
 }
 
+#[derive(Debug)]
 pub struct IndexOutcome {
     pub scanned: usize,
     pub updated: usize,
@@ -207,7 +208,7 @@ pub fn run_incremental_index(
     store: &dyn SearchStore,
     embedder: &mut QwenEmbedder,
     force: bool,
-    progress: Option<&dyn Fn(IndexProgress)>,
+    progress: Option<&(dyn Fn(IndexProgress) + Send + Sync)>,
 ) -> Result<IndexOutcome> {
     let index_dir = &config.storage.index_dir;
     let mut state = SyncState::load(&sync_state_path(index_dir))?;
@@ -254,12 +255,13 @@ let chunk_params = ChunkParams::new(config.chunk.chars / 4, 0.12);
     const EMBED_BATCH: usize = 64;
     let state_snapshot = state.clone();
     let next = AtomicUsize::new(0);
+    let drain_done = std::sync::atomic::AtomicBool::new(false);
 
     let (tx_a, rx_a) = sync_channel::<Produce>(128);
     let (tx_b, rx_b) = sync_channel::<StoreMsg>(4);
 
     let total = files.len();
-    let report = |progress: Option<&dyn Fn(IndexProgress)>, counters: &IndexCounters| {
+    let report = |progress: Option<&(dyn Fn(IndexProgress) + Send + Sync)>, counters: &IndexCounters| {
         if let Some(cb) = progress {
             cb(IndexProgress {
                 running: true,
@@ -420,13 +422,19 @@ let chunk_params = ChunkParams::new(config.chunk.chars / 4, 0.12);
             // each file is produced exactly once per pass.
             let state = &state_snapshot;
             let counters = &counters;
-            let tx = &tx_a;
             let chunk_params = &chunk_params;
             let force = force;
             let n_workers = std::thread::available_parallelism()
                 .map(|n| n.get().saturating_sub(1).max(2))
                 .unwrap_or(4);
             for _ in 0..n_workers {
+                // Each producer OWNS a sender clone: the channel closes only
+                // when the last producer finishes. (Borrowing one shared
+                // sender deadlocks shutdown — the original would stay alive
+                // in main until after join(), which waits for the pipeline
+                // to drain, which waits for the channel to close. Observed
+                // 2026-11-19: pass completed, process hung at 100% forever.)
+                let tx = tx_a.clone();
                 let next = &next;
                 let files = &files;
                 scope.spawn(move || {
@@ -437,18 +445,49 @@ let chunk_params = ChunkParams::new(config.chunk.chars / 4, 0.12);
                         }
                         let found = &files[i];
                         counters.scanned.fetch_add(1, Ordering::Relaxed);
-                        if let Err(err) = produce_one(found, state, force, chunk_params, tx) {
+                        if let Err(err) = produce_one(found, state, force, chunk_params, &tx) {
                             tracing::warn!(path = %found.path.display(), error = %err, "produce failed");
                             counters.failed.fetch_add(1, Ordering::Relaxed);
                         }
                     }
+                    // tx (clone) dropped here as this producer finishes.
                 });
             }
-            // tx_a (borrow) released when all producers finish → Stage B
-            // drains → its tx_b clone drops → Stage C drains → scope joins.
         }
+        // Shutdown signal chain: dropping the originals lets each stage's
+        // recv() return Err once its producers are done → B flushes the
+        // final batch and drops its tx_b clone → C drains, final-flushes and
+        // exits → join() below returns. Skipping either drop deadlocks.
+        drop(tx_a);
         drop(tx_b);
+
+        // Liveness heartbeat while the store thread drains: a silent join()
+        // made the 2026-11-19 shutdown deadlock look like work. Every 30s:
+        // log + emit progress so a stall surfaces within a minute.
+        let monitor = {
+            let counters = &counters;
+            let progress = progress;
+            let done = &drain_done;
+            scope.spawn(move || {
+                let mut last = std::time::Instant::now();
+                while !done.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if last.elapsed() >= std::time::Duration::from_secs(30) {
+                        last = std::time::Instant::now();
+                        tracing::info!(
+                            scanned = counters.scanned.load(Ordering::Relaxed),
+                            updated = counters.updated.load(Ordering::Relaxed),
+                            failed = counters.failed.load(Ordering::Relaxed),
+                            "indexing progress (waiting for pipeline drain)"
+                        );
+                        report(progress, counters);
+                    }
+                }
+            })
+        };
         let _ = store_handle.join();
+        drain_done.store(true, Ordering::Relaxed);
+        let _ = monitor.join();
         Ok(())
     })?;
 
