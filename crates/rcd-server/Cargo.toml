@@ -17,6 +17,7 @@ zvec-rust-build = "0.8.1"
 interprocess = { version = "2", features = ["tokio"] }
 futures-lite = "2"
 dunce = "1"
+wmi = "0.17"
 windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_Foundation"] }
 chrono = { workspace = true }
 libc = "0.2"
@@ -35,3 +36,9 @@ zvec-rust-build = "0.8.1"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+rmcp = { version = "3.11", features = ["client", "transport-child-process", "transport-io"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tempfile = "3"

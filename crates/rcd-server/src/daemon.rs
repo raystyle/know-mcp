@@ -9,9 +9,8 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use interprocess::local_socket::prelude::*;
-use interprocess::TryClone as _;
-use interprocess::local_socket::{GenericNamespaced, ListenerOptions, Stream};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use serde_json::{json, Value};
 
 use rcd_core::config::Config;
@@ -24,30 +23,53 @@ use rcd_core::sync::{self, IndexProgress};
 use rcd_core::zvec_store::ZvecStore;
 
 pub const SOCKET_NAME: &str = "rcd-mcp.sock";
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+// Cold start loads the embedding model twice (~25-40s on GPU) before
+// binding the admin port — readiness polling must outlast that.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Socket name (namespaced: named pipe on Windows, abstract/fs on Unix).
-/// Overridable via RCD_SOCKET_PATH.
-pub fn socket_name() -> String {
-    std::env::var("RCD_SOCKET_PATH").unwrap_or_else(|_| SOCKET_NAME.to_string())
+/// The daemon's loopback port file. A fresh daemon binds an ephemeral
+/// 127.0.0.1 port and writes it here (atomic rename); clients read it to
+/// connect. Replaces named pipes: the interprocess crate's Stream read side
+/// never returned data that a .NET client received within 1ms on the same
+/// pipe — measured (daemon.log 01:22:54: request completed in 0ms, the
+/// Rust read hung 20s).
+fn port_dir() -> std::path::PathBuf {
+    std::env::var_os("RCD_PORT_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("APPDATA")
+                .map(|d| std::path::PathBuf::from(d).join("rcd-mcp"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
-fn ns_name() -> Result<interprocess::local_socket::Name<'static>> {
-    socket_name().to_ns_name::<GenericNamespaced>().map_err(|e| anyhow::anyhow!("{e}"))
+fn port_file() -> std::path::PathBuf {
+    let dir = std::env::var_os("RCD_PORT_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("APPDATA")
+                .map(|d| std::path::PathBuf::from(d).join("rcd-mcp"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("admin.port")
 }
 
-/// Probe: is a daemon already listening? Time-bounded — never hangs.
+pub fn connect_admin(timeout: Duration) -> Result<TcpStream> {
+    let port: u16 = std::fs::read_to_string(port_file())?
+        .trim()
+        .parse()
+        .context("parsing admin port file")?;
+    let stream = TcpStream::connect(("127.0.0.1", port)).context("connecting to daemon")?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(stream)
+}
+
+/// Probe: is a daemon already listening? Time-bounded.
 pub fn is_daemon_listening() -> bool {
-    use interprocess::local_socket::ConnectOptions;
-    let Ok(name) = ns_name() else { return false };
-    ConnectOptions::new()
-        .name(name)
-        .wait_mode(interprocess::ConnectWaitMode::Timeout(
-            Duration::from_secs(2),
-        ))
-        .connect_sync()
-        .is_ok()
+    connect_admin(Duration::from_secs(2)).is_ok()
 }
 
 /// Ensure a daemon is running: probe, then spawn detached, then wait for
@@ -62,25 +84,85 @@ pub fn ensure_daemon(config_path: Option<&std::path::Path>) -> Result<()> {
 
 fn spawn_daemon_detached(config_path: Option<&std::path::Path>) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current exe")?;
-    let mut command = std::process::Command::new(&exe);
-    command.arg("daemon");
+    let mut args = String::from("daemon");
     if let Some(path) = config_path {
-        command.arg("--config").arg(path);
+        args.push_str(" --config ");
+        args.push_str(&path.display().to_string());
     }
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    detach_command(&mut command);
-    command.status().context("spawning detached daemon")?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        // Git Bash / terminal jobs kill children on close; DETACHED_PROCESS
+        // + CREATE_BREAKAWAY still dies when the job forbids breakaway
+        // (observed: daemon lived exactly as long as its launcher). The
+        // reliable escape is WMI Win32_Process.Create — the WMI service
+        // host creates the process, outside any caller job (herdr pattern;
+        // wmi-rs crate, same call shape as its own doc example).
+        let cmdline = format!("\"{}\" {}", exe.display(), args);
+        let con = match wmi::WMIConnection::new(wmi::COMLibrary::new()?) {
+            Ok(c) => c,
+            Err(e) => { anyhow::bail!("WMI connection failed: {e}"); }
+        };
+        let in_params = con
+            .get_object("Win32_Process")?
+            .get_method("Create")?
+            .unwrap()
+            .spawn_instance()?;
+        in_params.put_property("CommandLine", cmdline)?;
+        let out = con.exec_method("Win32_Process", "Create", Some(&in_params))?;
+        let ret = out
+            .as_ref()
+            .and_then(|o| o.get_property("ReturnValue").ok())
+            .and_then(|v| match v {
+                wmi::Variant::I4(v) => Some(v),
+                wmi::Variant::UI4(v) => Some(v as i32),
+                _ => None,
+            })
+            .unwrap_or(0);
+        // Process creation is asynchronous — the authoritative readiness
+        // check is wait_for_ready(), so treat 0/unknown as accepted and let
+        // the probe loop confirm.
+        if ret == 0 {
+            crate::logging::daemon_spawned(0, config_path);
+            return Ok(());
+        }
+        let mut props = String::new();
+        if let Some(o) = &out {
+            if let Ok(names) = o.list_properties() {
+                for name in names {
+                    if let Ok(val) = o.get_property(&name) {
+                        props.push_str(&format!(" {name}={val:?}"));
+                    }
+                }
+            }
+        }
+        anyhow::bail!("WMI daemon spawn failed (ret={ret};{props})");
+    }
+    #[cfg(unix)]
+    {
+        let mut command = std::process::Command::new(&exe);
+        command.arg("daemon");
+        if let Some(path) = config_path {
+            command.arg("--config").arg(path);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        detach_command(&mut command);
+        command.status().context("spawning detached daemon")?;
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
 fn detach_command(command: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     const DETACHED_PROCESS: u32 = 0x00000008;
-    command.creation_flags(DETACHED_PROCESS);
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    // BREAKAWAY escapes kill-on-close job objects (shells/terminals often
+    // put children in one; without this the daemon dies with its launcher —
+    // observed: spawned daemon vanished between two status calls).
+    command.creation_flags(DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB);
 }
 
 #[cfg(unix)]
@@ -144,7 +226,7 @@ pub async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
         .with_writer(std::sync::Mutex::new(log_file))
         .with_ansi(false)
         .init();
-    tracing::info!(socket = %socket_name(), "daemon starting");
+    crate::logging::daemon_startup("tcp-loopback", std::process::id());
 
     // Fingerprint check: incompatible index → wipe and rebuild.
     if config.storage.index_dir.exists()
@@ -173,15 +255,23 @@ pub async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
     });
 
     // Bind: first bind wins; AddrInUse = another daemon is already running.
-    let listener = ListenerOptions::new()
-        .name(ns_name()?)
-        .create_sync()
-        .map_err(|e| anyhow::anyhow!("binding daemon socket (already running?): {e}"))?;
+    // Single-instance mutex: a live daemon answers on the port file. Bind
+    // only when nobody answers; the port file write is atomic rename.
+    if is_daemon_listening() {
+        crate::logging::socket_bind_conflict("tcp-loopback");
+        anyhow::bail!("another daemon is already running");
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let tmp = port_file().with_extension("tmp");
+    std::fs::write(&tmp, port.to_string())?;
+    std::fs::rename(&tmp, port_file())?;
+    crate::logging::socket_bound(&format!("127.0.0.1:{port}"));
 
     // Background incremental index on a thread pool of one.
     spawn_reindex_task(state.clone(), false);
 
-    tracing::info!("daemon ready");
+    crate::logging::daemon_ready(&format!("127.0.0.1:{port}"));
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
@@ -212,7 +302,7 @@ fn daemon_log_path(config: &Config) -> PathBuf {
 }
 
 /// One JSON-per-line management connection (sync, thread per connection).
-fn serve_connection(stream: Stream, state: &Arc<DaemonState>) -> Result<()> {
+fn serve_connection(stream: TcpStream, state: &Arc<DaemonState>) -> Result<()> {
     use std::io::{BufRead, BufReader, Write};
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
@@ -226,9 +316,15 @@ fn serve_connection(stream: Stream, state: &Arc<DaemonState>) -> Result<()> {
         let Ok(request) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
+        let started = std::time::Instant::now();
+        let request_id = crate::logging::next_request_id();
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("?").to_string();
+        crate::logging::admin_request_start(request_id, &method);
         let reply = handle_admin(request, state).unwrap_or_else(|| {
             json!({"id": Value::Null, "error": "unhandled or malformed request"}).to_string()
         });
+        let outcome = if reply.contains("\"error\"") { "error" } else { "ok" };
+        crate::logging::admin_request_complete(request_id, &method, outcome, started.elapsed().as_millis());
         writeln!(writer, "{reply}")?;
         writer.flush()?;
     }
@@ -251,8 +347,9 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
     let result = match method.as_str() {
         "status" => Ok(status_json(state)),
         "stop" => {
-            tracing::info!("stop requested");
+            crate::logging::daemon_stopping();
             let _ = state.store.flush();
+            let _ = std::fs::remove_file(port_file());
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 std::process::exit(0);
@@ -279,8 +376,25 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
                 embedder: &mut embedder,
                 feedback: &state.feedback,
             };
-            svc.search(&SearchRequest { query, mode, top_k, path_filter, kind_filter: kind })
-                .map(|r| serde_json::to_value(&r).unwrap_or_default())
+            let started = std::time::Instant::now();
+            let mode_str = mode.map(|m| m.as_str()).unwrap_or("auto");
+            let result = svc.search(&SearchRequest {
+                query: query.clone(),
+                mode,
+                top_k,
+                path_filter: path_filter.clone(),
+                kind_filter: kind,
+            });
+            if let Ok(r) = &result {
+                crate::logging::search_complete(
+                    mode_str,
+                    r.hits.len(),
+                    r.hits.first().map(|h| h.score).unwrap_or(0.0),
+                    r.gap_recorded,
+                    started.elapsed().as_millis(),
+                );
+            }
+            result.map(|r| serde_json::to_value(&r).unwrap_or_default())
         }
         "save_note" => {
             let title = params.get("title")?.as_str()?.to_string();

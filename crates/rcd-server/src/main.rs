@@ -3,6 +3,7 @@
 
 mod daemon;
 mod client;
+mod logging;
 mod mcp;
 mod http;
 

@@ -5,27 +5,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use interprocess::local_socket::prelude::*;
-use interprocess::local_socket::{ConnectOptions, GenericNamespaced, Stream};
-use interprocess::ConnectWaitMode;
 use serde_json::{json, Value};
 
-use crate::daemon::{ensure_daemon, is_daemon_listening, socket_name};
+use crate::daemon::{connect_admin, ensure_daemon, is_daemon_listening};
 
-fn connect() -> Result<Stream> {
-    // Time-bounded connect: a busy daemon pipe errors fast instead of
-    // hanging forever (unbounded wait was the CLI-hang bug).
-    let name = socket_name().to_ns_name::<GenericNamespaced>()?;
-    ConnectOptions::new()
-        .name(name)
-        .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(5)))
-        .connect_sync()
-        .context("connecting to daemon socket (is the daemon busy or down?)")
-}
-
-/// Send one request, read one response line.
+/// Send one request, read one response line (time-bounded TCP loopback).
 pub fn admin_request(method: &str, params: Value) -> Result<Value> {
-    let mut stream = connect()?;
+    let mut stream = connect_admin(Duration::from_secs(10))?;
     let request = json!({"id": 1, "method": method, "params": params});
     use std::io::{BufRead, BufReader, Write};
     writeln!(stream, "{}", request)?;
@@ -33,6 +19,9 @@ pub fn admin_request(method: &str, params: Value) -> Result<Value> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
+    if line.is_empty() {
+        anyhow::bail!("daemon closed the connection without a reply");
+    }
     let response: Value = serde_json::from_str(line.trim())?;
     Ok(response)
 }

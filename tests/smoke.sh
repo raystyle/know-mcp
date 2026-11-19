@@ -16,8 +16,15 @@ esac
 # Isolated environment: own config, own socket, own index dir.
 SMOKE="$(cygpath -m "${TEMP:-/c/Windows/Temp}")/rcd-smoke-$$"
 mkdir -p "$SMOKE"
-trap 'rm -rf "$SMOKE"; "$EXE" --config "$SMOKE/rcd-mcp.toml" stop >/dev/null 2>&1 || true' EXIT
+cleanup() {
+    "$EXE" --config "$SMOKE/rcd-mcp.toml" stop >/dev/null 2>&1 || true
+    sleep 2
+    rm -rf "$SMOKE" 2>/dev/null || true
+}
+trap cleanup EXIT
 export RCD_SOCKET_PATH="rcd-mcp-smoke-$RANDOM"
+export RUST_LOG="rcd_mcp=debug,rcd_core=debug"
+LOG="$SMOKE/daemon.log"
 FIXTURE="$SMOKE/corpus"
 mkdir -p "$FIXTURE/code" "$FIXTURE/docs" "$FIXTURE/knowledge"
 
@@ -52,6 +59,11 @@ CONFIG_ARGS=(--config "$SMOKE/rcd-mcp.toml")
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
+# assert_log <pattern> <label> — debug-log evidence, not just exit codes.
+assert_log() {
+  grep -q "$1" "$LOG" || fail "log evidence missing: $2 (pattern: $1)"
+}
+
 # 1. Index the fixture (foreground, no daemon yet).
 "$EXE" "${CONFIG_ARGS[@]}" index || fail "index run"
 [[ -d "$SMOKE/index/collection" ]] || fail "collection dir created"
@@ -75,4 +87,12 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 OUT=$("$EXE" "${CONFIG_ARGS[@]}" index 2>/dev/null | grep -o "unchanged" | head -1)
 [[ -n "$OUT" ]] || fail "incremental second pass reports unchanged"
 
-pass "smoke: all checks"
+# 7. Debug-log evidence chain (acceptance proof):
+#    daemon lifecycle, single-instance lock, search outcomes, request ledger.
+assert_log 'event="daemon.startup"' "daemon startup line"
+assert_log 'event="socket.bind" outcome="ok"' "single-instance lock held"
+assert_log 'event="daemon.ready"' "daemon ready"
+assert_log 'event="search.complete".*outcome="ok"' "search completed with ok outcome"
+assert_log 'event="admin.request.complete".*outcome="ok"' "request ledger has ok entries"
+
+pass "smoke: all checks (functional + log evidence)"
