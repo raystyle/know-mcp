@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 pub const QWEN_DIM: usize = 1024;
 pub const GGUF_EXPECTED_BYTES: u64 = 639_150_592;
 /// Context window per embedding sequence (chunks are ~1000 chars, well under).
-const N_CTX: u32 = 1024;
+const N_CTX_PER_SEQ: u32 = 1024;
 
 /// sha256(model + dim + chunk params) fingerprint: mismatch triggers rebuild.
 pub fn embedding_fingerprint(model: &str, dim: usize, chunk_chars: usize, chunk_overlap: usize) -> String {
@@ -109,14 +109,19 @@ impl QwenEmbedder {
         Ok(Self { model, n_threads })
     }
 
-    fn make_context(&self) -> Result<LlamaContext> {
+    /// Context for embedding decode: one sequence, N_CTX_PER_SEQ KV budget.
+    /// Flash attention stays at llama.cpp's default (auto): forcing it ON
+    /// measured 89.1 vs 92.3 chunks/s on RTX 4060 (2026-11-19) — the ~250-
+    /// token chunks are too short for FA's block-skipping to pay for its
+    /// kernel overhead on this GPU.
+    fn make_context(&self) -> Result<LlamaContext<'_>> {
         self.model
             .new_context(
                 backend(),
                 LlamaContextParams::default()
-                    .with_n_ctx(std::num::NonZeroU32::new(N_CTX))
-                                                           .with_n_batch(1024)
-                    .with_n_ubatch(1024)
+                    .with_n_ctx(std::num::NonZeroU32::new(N_CTX_PER_SEQ))
+                    .with_n_batch(N_CTX_PER_SEQ)
+                    .with_n_ubatch(N_CTX_PER_SEQ)
                     .with_n_threads(self.n_threads)
                     .with_n_threads_batch(self.n_threads)
                     .with_embeddings(true)
@@ -132,88 +137,42 @@ impl QwenEmbedder {
             EmbedPurpose::Document => text.to_string(),
         };
         let mut ctx = self.make_context()?;
-        embed_one(&self.model, &mut ctx, &input, self.n_threads)
+        embed_one(&self.model, &mut ctx, &input)
     }
 
-    /// Batch-embed documents using llama.cpp multi-sequence batches: up to
-    /// SEQ_PER_BATCH sequences share ONE forward pass (each with its own
-    /// seq_id and position space), then embeddings_seq_ith(i) reads each
-    /// pooled vector. This is the real GPU batching — the previous
-    /// one-sequence-per-decode loop left the GPU idle between round trips.
+    /// Batch-embed documents over ONE reused context (single-sequence
+    /// decode per text). Multi-sequence batching (seq_id per text in one
+    /// pass, correctly configured: n_ctx = n_seq × N_CTX_PER_SEQ, n_seq_max,
+    /// n_batch = n_ctx) was measured 2026-11-19 on RTX 4060 after the
+    /// llama.cpp LM-head fix (#30445, git rev 0364f5da): width 2 = 1.52x
+    /// SLOWER than this loop — dense attention pays the full padded KV
+    /// width per query under causal masks, so batching loses once the
+    /// logits-copy bottleneck is gone. Don't retry without flash-attn
+    /// evidence; see KB-LLAMA-CPP-POOLED-EMBEDDING-SLOW.
     pub fn embed_documents(
         &mut self,
         texts: &[String],
         _max_batch_tokens: usize,
     ) -> Result<Vec<Vec<f32>>> {
-        // Single-sequence pipeline (proven ~15 files/s with the batched
-        // sync loop). Multi-sequence batching was tried and rejected:
-        // causal attention (required for embedding quality) clamps
-        // n_batch to n_ctx and yields no net GPU gain — see git history.
         let mut ctx = self.make_context()?;
         texts
             .iter()
-            .map(|t| embed_one(&self.model, &mut ctx, t, self.n_threads))
+            .map(|t| embed_one(&self.model, &mut ctx, t))
             .collect()
     }
-}
-
-/// One forward pass over several sequences. Positions restart per sequence
-/// (seq_id-scoped KV cache); n_ctx bounds each sequence independently.
-fn embed_group(
-    model: &LlamaModel,
-    ctx: &mut LlamaContext,
-    texts: &[&str],
-    _n_threads: i32,
-) -> Result<Vec<Vec<f32>>> {
-    use std::collections::HashMap;
-    let mut token_lists = Vec::with_capacity(texts.len());
-    let mut total = 0usize;
-    for text in texts {
-        let mut tokens = model.vocab().tokenize(text.as_bytes(), true, true);
-        if tokens.is_empty() {
-            anyhow::bail!("empty token sequence");
-        }
-        tokens.truncate(N_CTX as usize);
-        total += tokens.len();
-        token_lists.push(tokens);
-    }
-    // Each group is independent: reset the KV cache so every sequence
-    // starts at position 0 (decode requires pos continuity per seq).
-    ctx.clear_kv_cache();
-    let mut batch = LlamaBatch::new(total, token_lists.len() as i32);
-    for (seq, tokens) in token_lists.iter().enumerate() {
-        for (pos, token) in tokens.iter().enumerate() {
-            batch.add(*token, pos as i32, &[seq as i32], false)?;
-        }
-    }
-    ctx.decode(&mut batch)
-        .with_context(|| "llama multi-sequence decode")?;
-    let mut result = Vec::with_capacity(token_lists.len());
-    for seq in 0..token_lists.len() {
-        let emb = ctx
-            .embeddings_seq_ith(seq as i32)
-            .map_err(|e| anyhow::anyhow!("reading seq embedding {seq}: {e:?}"))?;
-        if emb.len() != QWEN_DIM {
-            anyhow::bail!("embedding dim {} != expected {QWEN_DIM}", emb.len());
-        }
-        result.push(l2_normalize(emb.to_vec()));
-    }
-    let _ = HashMap::<(), ()>::new; // silence unused import if edited
-    Ok(result)
 }
 
 fn embed_one(
     model: &LlamaModel,
     ctx: &mut LlamaContext,
     text: &str,
-    n_threads: i32,
 ) -> Result<Vec<f32>> {
     let mut tokens = model.vocab().tokenize(text.as_bytes(), true, true);
     if tokens.is_empty() {
         bail!("empty token sequence");
     }
-    if tokens.len() > N_CTX as usize {
-        tokens.truncate(N_CTX as usize);
+    if tokens.len() > N_CTX_PER_SEQ as usize {
+        tokens.truncate(N_CTX_PER_SEQ as usize);
     }
     // Each text is an independent sequence: reset the KV cache so positions
     // restart at 0 for sequence 0.
@@ -224,7 +183,6 @@ fn embed_one(
     }
     ctx.decode(&mut batch)
         .with_context(|| "llama decode (embedding)")?;
-    let _ = n_threads;
     let emb = ctx
         .embeddings_seq_ith(0)
         .map_err(|e| anyhow::anyhow!("reading embeddings: {e:?}"))?;
@@ -324,5 +282,95 @@ mod tests {
         let rate = out.len() as f32 / dt;
         eprintln!("throughput: {rate:.1} chunks/s");
         assert!(rate >= 0.3, "embedding too slow: {rate:.2} chunks/s (candle-class regression)");
+    }
+
+    /// Determinism + unit-norm guard: the same doc embedded twice through
+    /// embed_documents (batch call) and once through embed (single call)
+    /// must yield identical / cosine≈1 vectors. Replaces the old
+    /// batched-vs-serial equivalence test once multi-seq batching was
+    /// removed (it lost the 2026-11-19 benchmark: 1.52x slower at width 2
+    /// post LM-head fix). Guards against "batching broke quality" class
+    /// regressions (e.g. the NonCausal experiment: 0.83 → 0.49).
+    #[test]
+    fn embed_documents_deterministic_and_consistent_with_embed() {
+        let gguf = std::path::PathBuf::from(
+            "D:/search-harness/workspace/models/hf_Qwen_Qwen3-Embedding-0.6B-Q8_0.gguf",
+        );
+        if !gguf.is_file() {
+            eprintln!("skipping: model file not present");
+            return;
+        }
+        let Ok(mut emb) = QwenEmbedder::load(&gguf, "") else {
+            eprintln!("skipping: embedder failed to load");
+            return;
+        };
+        let docs: Vec<String> = (0..12)
+            .map(|i| {
+                format!("chunk {i} of the equivalence fixture: hybrid search over archived code 归档代码混合检索 ")
+                    .repeat(10)
+            })
+            .collect();
+        let first = emb.embed_documents(&docs, 8192).unwrap();
+        let second = emb.embed_documents(&docs, 8192).unwrap();
+        assert_eq!(first.len(), docs.len());
+        let mut worst = 1.0f32;
+        for (i, (a, b)) in first.iter().zip(&second).enumerate() {
+            assert_eq!(a.len(), QWEN_DIM, "dim @ {i}");
+            assert_eq!(a, b, "non-deterministic embedding @ {i}");
+            // L2-normalized ⇒ self-cosine is 1.0 (within float precision).
+            let c = cosine(a, a);
+            worst = worst.min(c);
+        }
+        // Batch path must agree with the single-text query-side path.
+        let single = emb.embed(&docs[0], EmbedPurpose::Document).unwrap();
+        assert_eq!(single.len(), QWEN_DIM);
+        let c = cosine(&first[0], &single);
+        assert!(
+            (c - 1.0).abs() < 1e-3,
+            "embed_documents disagrees with embed at doc 0: cosine {c:.6}"
+        );
+        eprintln!("worst self-cosine: {worst:.7}, batch-vs-single cosine: {c:.7}");
+    }
+
+    /// GPU throughput regression guard. 2026-11-19 baseline after the
+    /// llama.cpp LM-head fix (#30445, git rev 0364f5da): RTX 4060 ran this
+    /// exact fixture at ~92 docs/s. Floor set at 20 to hold the ~3.6x fix
+    /// across driver/thermal variance without flaking; the measured rate
+    /// prints for eyeballing. (Pre-fix rate was ~25 docs/s with the
+    /// full-vocab logits D2H copy dominating.)
+    #[test]
+    fn embed_documents_throughput_guard() {
+        let gguf = std::path::PathBuf::from(
+            "D:/search-harness/workspace/models/hf_Qwen_Qwen3-Embedding-0.6B-Q8_0.gguf",
+        );
+        if !gguf.is_file() {
+            eprintln!("skipping: model file not present");
+            return;
+        }
+        let Ok(mut emb) = QwenEmbedder::load(&gguf, "") else {
+            eprintln!("skipping: embedder failed to load");
+            return;
+        };
+        // Realistic chunk sizes (~250 tokens): 64 = one EMBED_BATCH flush.
+        let docs: Vec<String> = (0..64)
+            .map(|i| {
+                format!("chunk {i}: walk → read → chunk → embed → store pipeline over code repos and documents 管线分块 ")
+                    .repeat(6)
+            })
+            .collect();
+        // Warm up (first call pays model load / graph build / cache warmup).
+        let warm: Vec<String> = docs[..8].to_vec();
+        let _ = emb.embed_documents(&warm, 8192).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let out = emb.embed_documents(&docs, 8192).unwrap();
+        let dt = t0.elapsed();
+        assert_eq!(out.len(), docs.len());
+        let rate = out.len() as f32 / dt.as_secs_f32();
+        eprintln!("embed_documents: {dt:?} for {} docs = {rate:.1} chunks/s", docs.len());
+        assert!(
+            rate >= 20.0,
+            "embedding throughput regression: {rate:.1} chunks/s (baseline ~92 on RTX 4060, floor 20)"
+        );
     }
 }
