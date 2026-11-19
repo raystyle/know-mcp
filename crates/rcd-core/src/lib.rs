@@ -12,6 +12,7 @@
 pub mod config;
 pub mod walk;
 pub mod chunker;
+pub mod ast_chunker;
 pub mod embed;
 pub mod store;
 pub mod zvec_store;

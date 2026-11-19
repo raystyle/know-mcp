@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chunker::{chunk_text, heading_breadcrumb, ChunkParams};
+use crate::chunker::{chunk_text, chunk_text_code, heading_breadcrumb, ChunkParams};
 use crate::config::Config;
 use crate::embed::QwenEmbedder;
 use crate::store::{ChunkDoc, SearchStore};
@@ -362,7 +362,12 @@ let chunk_params = ChunkParams::new(config.chunk.chars / 4, 0.12);
 
         let loc0 = locator_of(canon_str);
         let _ = loc0;
-        let mut chunks = chunk_text(&text, &chunk_params);
+        let ext = found
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        let mut chunks = chunk_text_code(&text, ext, &chunk_params);
         // Context prepend (embed-time): markdown gets the heading
         // breadcrumb (mq path idea), code gets file path + language.
         if chunks.is_empty() {

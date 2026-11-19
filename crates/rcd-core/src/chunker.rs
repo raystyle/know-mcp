@@ -68,6 +68,72 @@ fn char_budget(text: &str, params: ChunkParams) -> usize {
     (params.tokens_per_chunk as f32 * chars_per_token(text)).max(200.0) as usize
 }
 
+/// Code-aware entry: prefer tree-sitter definition boundaries as cut
+/// points (qmd scoring); fall back to the regex/newline chunker when the
+/// language is unknown or parsing yields nothing.
+pub fn chunk_text_code(text: &str, ext: &str, params: &ChunkParams) -> Vec<Chunk> {
+    use crate::ast_chunker::{ast_break_points, AstLang};
+    let Some(lang) = AstLang::from_extension(ext) else {
+        return chunk_text(text, params);
+    };
+    let bps = ast_break_points(text, lang);
+    if bps.is_empty() {
+        return chunk_text(text, params);
+    }
+    // Snap cuts to the best AST breakpoint within the last 25% of the
+    // budget window (scored: higher wins, distance-decayed).
+    let budget = char_budget(text, *params);
+    let chars: Vec<char> = text.chars().collect();
+    // Byte offsets → char indexes (AST is byte-based).
+    let mut bp_chars: Vec<(usize, u32)> = Vec::new();
+    for bp in &bps {
+        if let Some(ci) = char_index_at_byte(&chars, bp.offset) {
+            bp_chars.push((ci, bp.score));
+        }
+    }
+    let mut chunks = Vec::new();
+    let mut pos = 0usize;
+    while pos < chars.len() {
+        let target = pos + budget;
+        let mut end = target.min(chars.len());
+        if end < chars.len() && !bp_chars.is_empty() {
+            // Search window: [pos + budget*3/4, end]
+            let win_start = pos + budget * 3 / 4;
+            let best = bp_chars
+                .iter()
+                .filter(|(ci, _)| *ci > win_start && *ci <= end)
+                .max_by_key(|(ci, s)| (*s, std::cmp::Reverse(*ci)));
+            if let Some((ci, _)) = best {
+                end = *ci;
+            }
+        }
+        if end <= pos {
+            end = (pos + 1).min(chars.len());
+        }
+        let start_line = line_of(&chars, pos);
+        let end_line = line_of(&chars, end.saturating_sub(1));
+        let slice: String = chars[pos..end].iter().collect();
+        chunks.push(Chunk { text: slice, context: String::new(), start_line, end_line });
+        if end >= chars.len() {
+            break;
+        }
+        pos = end;
+    }
+    chunks
+}
+
+/// Char index for a byte offset (linear scan; fine for chunk-time costs).
+fn char_index_at_byte(chars: &[char], byte_off: usize) -> Option<usize> {
+    let mut b = 0usize;
+    for (i, c) in chars.iter().enumerate() {
+        if b >= byte_off {
+            return Some(i);
+        }
+        b += c.len_utf8();
+    }
+    None
+}
+
 /// Split into overlapping chunks with newline snap and fence protection.
 pub fn chunk_text(text: &str, params_ref: &ChunkParams) -> Vec<Chunk> {
     if text.trim().is_empty() {
@@ -287,6 +353,32 @@ mod tests {
         assert_eq!(heading_breadcrumb(md, 4), "Guide > Install > Linux");
         assert_eq!(heading_breadcrumb(md, 2), "Guide");
         assert_eq!(heading_breadcrumb(md, 1), "");
+    }
+
+    #[test]
+    fn code_chunker_cuts_at_definitions() {
+        let fn_body = "pub fn f(i: usize) -> usize {
+".to_string() + &"    let x = i + 1;
+".repeat(120) + "}
+";
+        let mut src_code = String::new();
+        for i in 0..6 {
+            src_code.push_str(&fn_body.replace("fn f(", &format!("fn f{i}(")));
+        }
+        let chunks = chunk_text_code(&src_code, "rs", &ChunkParams::default());
+        assert!(chunks.len() >= 3, "expected multiple def-boundary chunks");
+        // Every chunk boundary should start at a fn definition.
+        for c in &chunks[1..] {
+            assert!(c.text.starts_with("pub fn"), "chunk not at a boundary: {:?}…", &c.text[..12.min(c.text.len())]);
+        }
+    }
+
+    #[test]
+    fn code_chunker_falls_back_for_unknown_ext() {
+        let text = "a ".repeat(2000);
+        let via_code = chunk_text_code(&text, "weird", &ChunkParams::default());
+        let via_plain = chunk_text(&text, &ChunkParams::default());
+        assert_eq!(via_code.len(), via_plain.len());
     }
 
     #[test]
