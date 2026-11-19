@@ -10,7 +10,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chunker::{chunk_text, ChunkParams};
+use crate::chunker::{chunk_text, heading_breadcrumb, ChunkParams};
 use crate::config::Config;
 use crate::embed::QwenEmbedder;
 use crate::store::{ChunkDoc, SearchStore};
@@ -153,7 +153,9 @@ pub fn run_incremental_index(
     let index_dir = &config.storage.index_dir;
     let mut state = SyncState::load(&sync_state_path(index_dir))?;
     let files = collect_files(config)?;
-    let chunk_params = ChunkParams::new(config.chunk.chars, config.chunk.overlap);
+    // Token-budget chunking (CJK-adaptive). Legacy char config maps to a
+// token budget: chars/4 ≈ tokens for the ASCII-ish legacy default.
+let chunk_params = ChunkParams::new(config.chunk.chars / 4, 0.12);
 
     let mut outcome = IndexOutcome { scanned: 0, updated: 0, unchanged: 0, deleted: 0, failed: 0, skipped_binary: 0 };
     let mut report = |progress: Option<&dyn Fn(IndexProgress)>, scanned: usize, outcome: &IndexOutcome| {
@@ -217,7 +219,13 @@ pub fn run_incremental_index(
         let mut texts = Vec::with_capacity(pending.iter().map(|p| p.chunks.len()).sum::<usize>());
         for p in pending.iter() {
             for c in &p.chunks {
-                texts.push(c.text.clone());
+                // Embed context + body (qmd formatDocForEmbedding analog:
+                // Qwen3 documents take plain "title newline text" style).
+                texts.push(if c.context.is_empty() {
+                    c.text.clone()
+                } else {
+                    format!("{}\n{}", c.context, c.text)
+                });
             }
         }
         let embeddings = match embedder.embed_documents(&texts, config.embed.max_batch_tokens) {
@@ -352,7 +360,22 @@ pub fn run_incremental_index(
             }
         }
 
-        let chunks = chunk_text(&text, chunk_params);
+        let loc0 = locator_of(canon_str);
+        let _ = loc0;
+        let mut chunks = chunk_text(&text, &chunk_params);
+        // Context prepend (embed-time): markdown gets the heading
+        // breadcrumb (mq path idea), code gets file path + language.
+        if chunks.is_empty() {
+            // nothing to contextualize
+        } else {
+            let ctx = if lang_is_markdown(&found.path) {
+                heading_breadcrumb(&text, chunks[0].start_line)
+            } else {
+                format!("{} [{}]", rel_path_of(&canonical, &found.root), ext_of(&found.path))
+            };
+            let budget = 600 * 4; // token budget * worst-case chars/token
+            crate::chunker::contextualize(&mut chunks, &ctx, budget);
+        }
         if chunks.is_empty() {
             // File became empty: drop old chunks if any.
             if let Some(p) = prior {
@@ -442,4 +465,27 @@ fn note_id_of(title: &str, kind: crate::Kind) -> Option<String> {
         crate::Kind::Note => Some(title.to_string()),
         crate::Kind::Archive => None,
     }
+}
+
+/// Whether the path looks like a markdown file.
+fn lang_is_markdown(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        .unwrap_or(false)
+}
+
+/// Path relative to the root, forward-slash form.
+fn rel_path_of(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string())
+}
+
+/// File extension lowercased.
+fn ext_of(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase()
 }
