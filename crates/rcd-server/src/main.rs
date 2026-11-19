@@ -17,6 +17,15 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<std::path::PathBuf>,
 
+    /// Admin port-file directory (default: RCD_PORT_DIR or %APPDATA%/rcd-mcp).
+    /// Echoed through WMI spawns, which do not inherit the environment.
+    #[arg(long, global = true)]
+    port_dir: Option<std::path::PathBuf>,
+
+    /// Log level override (default: RUST_LOG), echoed through WMI spawns.
+    #[arg(long, global = true)]
+    log_level: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -85,6 +94,14 @@ async fn main() -> Result<()> {
     configure_lib_search_path();
 
     let cli = Cli::parse();
+    // Flags beat env (the WMI spawn path passes them explicitly because
+    // Win32_Process.Create drops the caller's environment).
+    if let Some(dir) = cli.port_dir.clone() {
+        std::env::set_var("RCD_PORT_DIR", dir);
+    }
+    if let Some(level) = cli.log_level.clone() {
+        std::env::set_var("RUST_LOG", level);
+    }
     match cli.command {
         Command::Daemon => daemon::run_daemon(cli.config).await,
         Command::Mcp => client::run_mcp_stdio(cli.config).await,

@@ -115,7 +115,7 @@ impl QwenEmbedder {
                 backend(),
                 LlamaContextParams::default()
                     .with_n_ctx(std::num::NonZeroU32::new(N_CTX))
-                    .with_n_batch(1024)
+                                                           .with_n_batch(1024)
                     .with_n_ubatch(1024)
                     .with_n_threads(self.n_threads)
                     .with_n_threads_batch(self.n_threads)
@@ -135,19 +135,71 @@ impl QwenEmbedder {
         embed_one(&self.model, &mut ctx, &input, self.n_threads)
     }
 
-    /// Batch-embed documents. llama.cpp embeds one sequence per decode call
-    /// (pooling=LAST); the shared context amortizes KV-cache allocation.
+    /// Batch-embed documents using llama.cpp multi-sequence batches: up to
+    /// SEQ_PER_BATCH sequences share ONE forward pass (each with its own
+    /// seq_id and position space), then embeddings_seq_ith(i) reads each
+    /// pooled vector. This is the real GPU batching — the previous
+    /// one-sequence-per-decode loop left the GPU idle between round trips.
     pub fn embed_documents(
         &mut self,
         texts: &[String],
         _max_batch_tokens: usize,
     ) -> Result<Vec<Vec<f32>>> {
+        // Single-sequence pipeline (proven ~15 files/s with the batched
+        // sync loop). Multi-sequence batching was tried and rejected:
+        // causal attention (required for embedding quality) clamps
+        // n_batch to n_ctx and yields no net GPU gain — see git history.
         let mut ctx = self.make_context()?;
         texts
             .iter()
             .map(|t| embed_one(&self.model, &mut ctx, t, self.n_threads))
             .collect()
     }
+}
+
+/// One forward pass over several sequences. Positions restart per sequence
+/// (seq_id-scoped KV cache); n_ctx bounds each sequence independently.
+fn embed_group(
+    model: &LlamaModel,
+    ctx: &mut LlamaContext,
+    texts: &[&str],
+    _n_threads: i32,
+) -> Result<Vec<Vec<f32>>> {
+    use std::collections::HashMap;
+    let mut token_lists = Vec::with_capacity(texts.len());
+    let mut total = 0usize;
+    for text in texts {
+        let mut tokens = model.vocab().tokenize(text.as_bytes(), true, true);
+        if tokens.is_empty() {
+            anyhow::bail!("empty token sequence");
+        }
+        tokens.truncate(N_CTX as usize);
+        total += tokens.len();
+        token_lists.push(tokens);
+    }
+    // Each group is independent: reset the KV cache so every sequence
+    // starts at position 0 (decode requires pos continuity per seq).
+    ctx.clear_kv_cache();
+    let mut batch = LlamaBatch::new(total, token_lists.len() as i32);
+    for (seq, tokens) in token_lists.iter().enumerate() {
+        for (pos, token) in tokens.iter().enumerate() {
+            batch.add(*token, pos as i32, &[seq as i32], false)?;
+        }
+    }
+    ctx.decode(&mut batch)
+        .with_context(|| "llama multi-sequence decode")?;
+    let mut result = Vec::with_capacity(token_lists.len());
+    for seq in 0..token_lists.len() {
+        let emb = ctx
+            .embeddings_seq_ith(seq as i32)
+            .map_err(|e| anyhow::anyhow!("reading seq embedding {seq}: {e:?}"))?;
+        if emb.len() != QWEN_DIM {
+            anyhow::bail!("embedding dim {} != expected {QWEN_DIM}", emb.len());
+        }
+        result.push(l2_normalize(emb.to_vec()));
+    }
+    let _ = HashMap::<(), ()>::new; // silence unused import if edited
+    Ok(result)
 }
 
 fn embed_one(

@@ -73,7 +73,23 @@ pub struct IndexProgress {
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// One file's stage-1 output, queued for batch embedding.
+#[derive(Debug, Clone)]
+struct PendingFile {
+    loc: String,
+    canon: String,
+    root: String,
+    rel_path: String,
+    title: String,
+    lang: String,
+    kind: crate::Kind,
+    note_id: Option<String>,
+    mtime_ms: i64,
+    size: u64,
+    content_hash: String,
+    chunks: Vec<crate::chunker::Chunk>,
+}
+
 pub struct IndexOutcome {
     pub scanned: usize,
     pub updated: usize,
@@ -177,7 +193,83 @@ pub fn run_incremental_index(
         }
     }
 
-    // 2. Upsert new/changed files.
+    // 2. Upsert new/changed files — pipelined in batches.
+    //
+    // Stage 1 (cheap): read/validate/chunk each changed file into a pending
+    // batch. Stage 2 (expensive): once the batch holds EMBED_BATCH chunks,
+    // embed them in ONE call and upsert together. Per-file embedding kept
+    // the GPU idle between round trips (~1.1 files/s observed); batching
+    // amortizes the round trip and keeps the GPU fed.
+    const EMBED_BATCH: usize = 64;
+    let mut pending: Vec<PendingFile> = Vec::new();
+    let mut pending_chunks: usize = 0;
+
+    let mut flush = |pending: &mut Vec<PendingFile>,
+                     embedder: &mut QwenEmbedder,
+                     store: &dyn SearchStore,
+                     state: &mut SyncState,
+                     outcome: &mut IndexOutcome|
+     -> Result<()> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        // Gather all chunk texts in order.
+        let mut texts = Vec::with_capacity(pending.iter().map(|p| p.chunks.len()).sum::<usize>());
+        for p in pending.iter() {
+            for c in &p.chunks {
+                texts.push(c.text.clone());
+            }
+        }
+        let embeddings = match embedder.embed_documents(&texts, config.embed.max_batch_tokens) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(error = %err, "batch embedding failed");
+                outcome.failed += pending.len();
+                pending.clear();
+                return Ok(());
+            }
+        };
+        let mut off = 0usize;
+        for p in pending.drain(..) {
+            let n = p.chunks.len();
+            let mut docs = Vec::with_capacity(n);
+            for (i, chunk) in p.chunks.iter().enumerate() {
+                docs.push(ChunkDoc {
+                    pk: format!("{}-{i}", p.loc),
+                    kind: p.kind,
+                    path: p.canon.clone(),
+                    root: p.root.clone(),
+                    rel_path: p.rel_path.clone(),
+                    title: p.title.clone(),
+                    text: chunk.text.clone(),
+                    chunk_index: i as u32,
+                    start_line: chunk.start_line,
+                    end_line: chunk.end_line,
+                    lang: p.lang.clone(),
+                    note_id: p.note_id.clone(),
+                    embedding: embeddings[off + i].clone(),
+                });
+            }
+            off += n;
+            if let Err(err) = store.upsert(&docs) {
+                tracing::warn!(path = %p.canon, error = %err, "upsert failed");
+                outcome.failed += 1;
+                continue;
+            }
+            state.files.insert(
+                p.canon.clone(),
+                FileSyncState {
+                    mtime_ms: p.mtime_ms,
+                    size: p.size,
+                    content_hash: p.content_hash.clone(),
+                    chunk_count: n as u32,
+                },
+            );
+            outcome.updated += 1;
+        }
+        Ok(())
+    };
+
     for found in &files {
         outcome.scanned += 1;
         if outcome.scanned % 10 == 0 {
@@ -274,18 +366,6 @@ pub fn run_incremental_index(
             continue;
         }
 
-        let embeddings = match embedder.embed_documents(
-            &chunks.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),
-            config.embed.max_batch_tokens,
-        ) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(path = canon_str, error = %err, "embedding failed");
-                outcome.failed += 1;
-                continue;
-            }
-        };
-
         let loc = locator_of(canon_str);
         let title = title_of(&text, &found.path);
         let lang = found
@@ -309,40 +389,30 @@ pub fn run_incremental_index(
             }
         }
 
-        let mut docs = Vec::with_capacity(chunks.len());
-        for (i, chunk) in chunks.iter().enumerate() {
-            docs.push(ChunkDoc {
-                pk: format!("{loc}-{i}"),
-                kind: found.kind,
-                path: canon_str.to_string(),
-                root: found.root.to_string_lossy().to_string(),
-                rel_path: rel_path.clone(),
-                title: title.clone(),
-                text: chunk.text.clone(),
-                chunk_index: i as u32,
-                start_line: chunk.start_line,
-                end_line: chunk.end_line,
-                lang: lang.clone(),
-                note_id: note_id_of(&title, found.kind),
-                embedding: embeddings[i].clone(),
-            });
+        // Stage 1: queue this file; flush when the batch is big enough.
+        pending.push(PendingFile {
+            loc,
+            canon: canon_str.to_string(),
+            root: found.root.to_string_lossy().to_string(),
+            rel_path,
+            title: title.clone(),
+            lang,
+            kind: found.kind,
+            note_id: note_id_of(&title, found.kind),
+            mtime_ms,
+            size: meta.len(),
+            content_hash,
+            chunks,
+        });
+        pending_chunks += pending.last().unwrap().chunks.len();
+        if pending_chunks >= EMBED_BATCH {
+            flush(&mut pending, embedder, store, &mut state, &mut outcome)?;
+            pending_chunks = 0;
         }
-        if let Err(err) = store.upsert(&docs) {
-            tracing::warn!(path = canon_str, error = %err, "upsert failed");
-            outcome.failed += 1;
-            continue;
-        }
-        state.files.insert(
-            canon_str.to_string(),
-            FileSyncState {
-                mtime_ms,
-                size: meta.len(),
-                content_hash,
-                chunk_count: chunks.len() as u32,
-            },
-        );
-        outcome.updated += 1;
     }
+
+    // Drain the final partial batch.
+    flush(&mut pending, embedder, store, &mut state, &mut outcome)?;
 
     report(progress, outcome.scanned, &outcome);
     state.save(&sync_state_path(index_dir))?;

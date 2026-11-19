@@ -89,6 +89,17 @@ fn spawn_daemon_detached(config_path: Option<&std::path::Path>) -> Result<()> {
         args.push_str(" --config ");
         args.push_str(&path.display().to_string());
     }
+    // CRITICAL: WMI Win32_Process.Create does NOT inherit the caller's
+    // environment (only variables passed via ProcessStartup). Without
+    // echoing RCD_PORT_DIR here, a test-spawned daemon would write its
+    // port to the default dir while the caller watches the test dir —
+    // two daemons, invisible to each other (observed in smoke).
+    if let Some(port_dir) = std::env::var_os("RCD_PORT_DIR") {
+        args.push_str(&format!(" --port-dir \"{}\"", port_dir.to_string_lossy()));
+    }
+    if let Some(log) = std::env::var_os("RUST_LOG") {
+        args.push_str(&format!(" --log-level \"{}\"", log.to_string_lossy()));
+    }
     #[cfg(windows)]
     {
         // Git Bash / terminal jobs kill children on close; DETACHED_PROCESS
@@ -257,7 +268,16 @@ pub async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
     // Bind: first bind wins; AddrInUse = another daemon is already running.
     // Single-instance mutex: a live daemon answers on the port file. Bind
     // only when nobody answers; the port file write is atomic rename.
+    // Mutex scope = port dir: distinct RCD_PORT_DIR values are distinct
+    // daemons by design (test isolation) — the log lines below make any
+    // real-world double-daemon incident traceable from the log alone.
+    let port_dir_display = port_dir().display().to_string();
+    crate::logging::port_dir_selected(&port_dir_display);
     if is_daemon_listening() {
+        let holder = std::fs::read_to_string(port_file())
+            .map(|s| format!("port {}", s.trim()))
+            .unwrap_or_else(|_| "unknown holder".into());
+        crate::logging::mutex_lost(&port_dir_display, &holder);
         crate::logging::socket_bind_conflict("tcp-loopback");
         anyhow::bail!("another daemon is already running");
     }

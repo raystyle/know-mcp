@@ -4,6 +4,10 @@
 # lints/rcd-lint.
 
 disallowed-methods = [
+    # Daemon-mutex guard: spawning the daemon via raw Command loses the
+    # WMI environment echo (RCD_PORT_DIR), producing mutually-invisible
+    # daemons. All daemon spawns must go through spawn_daemon_detached.
+    { path = "std::process::Command::spawn", reason = "daemon spawns must use spawn_daemon_detached (WMI env echo); raw spawn breaks the single-instance mutex" },
     # Bug history: embeddings_ith returned per-token rows and produced
     # all-zero embeddings under pooling=LAST. Use embeddings_seq_ith.
     { path = "llama_cpp_2::context::LlamaContext::embeddings_ith", reason = "use embeddings_seq_ith — per-token rows are empty under pooling (all-zero embeddings bug)" },

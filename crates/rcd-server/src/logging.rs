@@ -172,3 +172,28 @@ pub fn daemon_spawned(pid: u32, config: Option<&std::path::Path>) {
         "daemon spawned detached"
     );
 }
+
+/// Single-instance mutex was already held — the loser exits. Logged by BOTH
+/// sides (the winner logs socket_bound) so mutex incidents always leave a
+/// paired trail in the daemon log.
+pub fn mutex_lost(port_dir: &str, holder: &str) {
+    tracing::warn!(
+        event = "daemon.mutex_lost",
+        subsystem = "daemon",
+        outcome = "error",
+        port_dir,
+        holder,
+        "another daemon answered the probe; this process exits without binding"
+    );
+}
+
+/// Port-directory provenance: which dir this daemon uses (mutex scope).
+pub fn port_dir_selected(port_dir: &str) {
+    tracing::info!(
+        event = "daemon.port_dir",
+        subsystem = "daemon",
+        outcome = "ok",
+        port_dir,
+        "admin port directory selected (mutex scope)"
+    );
+}

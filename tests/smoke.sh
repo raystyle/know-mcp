@@ -22,9 +22,10 @@ cleanup() {
     rm -rf "$SMOKE" 2>/dev/null || true
 }
 trap cleanup EXIT
-export RCD_SOCKET_PATH="rcd-mcp-smoke-$RANDOM"
+export RCD_PORT_DIR="$SMOKE/portdir"
 export RUST_LOG="rcd_mcp=debug,rcd_core=debug"
-LOG="$SMOKE/daemon.log"
+LOG="$APPDATA/rcd-mcp/daemon.log"
+mkdir -p "$RCD_PORT_DIR"
 FIXTURE="$SMOKE/corpus"
 mkdir -p "$FIXTURE/code" "$FIXTURE/docs" "$FIXTURE/knowledge"
 
@@ -68,8 +69,11 @@ assert_log() {
 "$EXE" "${CONFIG_ARGS[@]}" index || fail "index run"
 [[ -d "$SMOKE/index/collection" ]] || fail "collection dir created"
 
-# 2. Daemon up + status answers.
-"$EXE" "${CONFIG_ARGS[@]}" status >/dev/null || fail "daemon auto-spawn"
+# 2. Daemon up + status answers (cold start loads the model: allow 3 min).
+if ! timeout 180 "$EXE" "${CONFIG_ARGS[@]}" status >/dev/null; then
+  sleep 5
+  timeout 60 "$EXE" "${CONFIG_ARGS[@]}" status >/dev/null || fail "daemon auto-spawn"
+fi
 
 # 3. Identifier search hits the Rust file.
 "$EXE" "${CONFIG_ARGS[@]}" search "ZVecInitialize" --mode keyword | grep -q "zvec_probe" \
@@ -84,7 +88,7 @@ assert_log() {
   || fail "hybrid search"
 
 # 6. Incremental second pass is unchanged (fast path).
-OUT=$("$EXE" "${CONFIG_ARGS[@]}" index 2>/dev/null | grep -o "unchanged" | head -1)
+OUT=$(timeout 120 "$EXE" "${CONFIG_ARGS[@]}" index 2>/dev/null | grep -o "unchanged" | head -1)
 [[ -n "$OUT" ]] || fail "incremental second pass reports unchanged"
 
 # 7. Debug-log evidence chain (acceptance proof):
