@@ -13,7 +13,7 @@ disallowed-methods = [
     { path = "llama_cpp_2::context::LlamaContext::embeddings_ith", reason = "use embeddings_seq_ith — per-token rows are empty under pooling (all-zero embeddings bug)" },
     # zvec: delete_by_filter throws when nothing matches.
     { path = "zvec_rust::collection::Collection::delete_by_filter", reason = "throws on no-match; use deterministic pks + delete()" },
-    # zvec: optimize is fragile on some volumes (Parquet footer errors) —
-    # only the explicit --optimize path may call it.
-    { path = "zvec_rust::collection::Collection::optimize", reason = "fragile on some volumes; only the explicit opt-in path may call it" },
+    # zvec optimize: removed 2026-11-19 — the tail-dropping bug (alibaba/zvec
+    # #724) is fixed upstream and sync.rs now calls it as a controlled
+    # end-of-pass step (warn-only on failure).
 ]

@@ -5,12 +5,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
+
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::chunker::{chunk_text, chunk_text_code, heading_breadcrumb, ChunkParams};
+use crate::chunker::{chunk_text_code, heading_breadcrumb, ChunkParams};
 use crate::config::Config;
 use crate::embed::QwenEmbedder;
 use crate::store::{ChunkDoc, SearchStore};
@@ -88,6 +91,62 @@ struct PendingFile {
     size: u64,
     content_hash: String,
     chunks: Vec<crate::chunker::Chunk>,
+    /// Final embed inputs (context + body), assembled by the producer so
+    /// the embed thread only decodes: context-empty → bare text, else
+    /// "context\ntext".
+    embed_texts: Vec<String>,
+    /// Chunk count of the previous version, for the shrink-surplus delete
+    /// (applied by the store stage before the new upsert).
+    prior_chunk_count: Option<u32>,
+}
+
+/// Atomic per-stage counters shared across the pipeline threads.
+#[derive(Default)]
+struct IndexCounters {
+    scanned: AtomicUsize,
+    updated: AtomicUsize,
+    unchanged: AtomicUsize,
+    deleted: AtomicUsize,
+    failed: AtomicUsize,
+    skipped_binary: AtomicUsize,
+    /// Total chunks handed to the store this pass (drives the end-of-pass
+    /// optimize decision).
+    upserted_chunks: AtomicUsize,
+}
+
+impl IndexCounters {
+    fn snapshot(&self) -> IndexOutcome {
+        IndexOutcome {
+            scanned: self.scanned.load(Ordering::Relaxed),
+            updated: self.updated.load(Ordering::Relaxed),
+            unchanged: self.unchanged.load(Ordering::Relaxed),
+            deleted: self.deleted.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            skipped_binary: self.skipped_binary.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Stage A → B message: one file's read/chunk outcome.
+enum Produce {
+    /// Chunks ready for embedding.
+    Batch(PendingFile),
+    /// mtime/size changed but content identical: refresh the state entry.
+    Refresh(String, FileSyncState),
+    /// File became empty: drop prior chunks and the state entry.
+    Dropped(String, u32),
+}
+
+/// Stage B → C message: embedding results to persist.
+enum StoreMsg {
+    Embedded {
+        files: Vec<PendingFile>,
+        embeddings: Vec<Vec<f32>>,
+        /// Files in this group whose embedding failed (store stage skips them).
+        failed: usize,
+    },
+    Refresh(String, FileSyncState),
+    Dropped(String, u32),
 }
 
 pub struct IndexOutcome {
@@ -133,11 +192,11 @@ pub fn meta_compatible(index_dir: &Path, config: &Config) -> bool {
     let Ok(meta) = serde_json::from_str::<IndexMeta>(&raw) else {
         return false;
     };
-    meta.fingerprint == fingerprint_of(config) && meta.schema_version == 1
+    meta.fingerprint == fingerprint_of(config) && meta.schema_version == 2
 }
 
 pub fn write_meta(index_dir: &Path, config: &Config) -> Result<()> {
-    let meta = IndexMeta { fingerprint: fingerprint_of(config), schema_version: 1 };
+    let meta = IndexMeta { fingerprint: fingerprint_of(config), schema_version: 2 };
     atomic_write(&meta_path(index_dir), serde_json::to_string_pretty(&meta)?.as_bytes())
 }
 
@@ -157,20 +216,7 @@ pub fn run_incremental_index(
 // token budget: chars/4 ≈ tokens for the ASCII-ish legacy default.
 let chunk_params = ChunkParams::new(config.chunk.chars / 4, 0.12);
 
-    let mut outcome = IndexOutcome { scanned: 0, updated: 0, unchanged: 0, deleted: 0, failed: 0, skipped_binary: 0 };
-    let mut report = |progress: Option<&dyn Fn(IndexProgress)>, scanned: usize, outcome: &IndexOutcome| {
-        if let Some(cb) = progress {
-            cb(IndexProgress {
-                running: true,
-                scanned,
-                updated: outcome.updated,
-                deleted: outcome.deleted,
-                failed: outcome.failed,
-                total: files.len(),
-                started_at: None,
-            });
-        }
-    };
+    let counters = IndexCounters::default();
 
     // 1. Handle deletions: files previously indexed but no longer present.
     let present: std::collections::HashSet<String> = files
@@ -190,262 +236,417 @@ let chunk_params = ChunkParams::new(config.chunk.chars / 4, 0.12);
             let pks: Vec<String> =
                 (0..fs.chunk_count).map(|i| format!("{loc}-{i}")).collect();
             if store.delete(&pks).is_ok() {
-                outcome.deleted += 1;
+                counters.deleted.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
-    // 2. Upsert new/changed files — pipelined in batches.
+    // 2. Upsert new/changed files — three-stage pipeline.
     //
-    // Stage 1 (cheap): read/validate/chunk each changed file into a pending
-    // batch. Stage 2 (expensive): once the batch holds EMBED_BATCH chunks,
-    // embed them in ONE call and upsert together. Per-file embedding kept
-    // the GPU idle between round trips (~1.1 files/s observed); batching
-    // amortizes the round trip and keeps the GPU fed.
+    // Stage A (N producer threads): read/validate/chunk — pure CPU+IO, the
+    // measured bottleneck once GPU embedding was fixed (1.75 cores busy,
+    // GPU 0-29% bursts). Stage B (dedicated thread): GPU batch embedding,
+    // the only stage that needs &mut embedder. Stage C (1 store thread):
+    // all store mutations in arrival order, so deletes/upserts stay
+    // consistent. Bounded channels give backpressure: A stalls if B can't
+    // keep up, B stalls if C can't. Scoped threads + Send/Sync bounds make
+    // the sharing safe without unsafe.
     const EMBED_BATCH: usize = 64;
-    let mut pending: Vec<PendingFile> = Vec::new();
-    let mut pending_chunks: usize = 0;
+    let state_snapshot = state.clone();
+    let next = AtomicUsize::new(0);
 
-    let mut flush = |pending: &mut Vec<PendingFile>,
-                     embedder: &mut QwenEmbedder,
-                     store: &dyn SearchStore,
-                     state: &mut SyncState,
-                     outcome: &mut IndexOutcome|
-     -> Result<()> {
-        if pending.is_empty() {
-            return Ok(());
+    let (tx_a, rx_a) = sync_channel::<Produce>(128);
+    let (tx_b, rx_b) = sync_channel::<StoreMsg>(4);
+
+    let total = files.len();
+    let report = |progress: Option<&dyn Fn(IndexProgress)>, counters: &IndexCounters| {
+        if let Some(cb) = progress {
+            cb(IndexProgress {
+                running: true,
+                scanned: counters.scanned.load(Ordering::Relaxed),
+                updated: counters.updated.load(Ordering::Relaxed),
+                deleted: counters.deleted.load(Ordering::Relaxed),
+                failed: counters.failed.load(Ordering::Relaxed),
+                total,
+                started_at: None,
+            });
         }
-        // Gather all chunk texts in order.
-        let mut texts = Vec::with_capacity(pending.iter().map(|p| p.chunks.len()).sum::<usize>());
-        for p in pending.iter() {
-            for c in &p.chunks {
-                // Embed context + body (qmd formatDocForEmbedding analog:
-                // Qwen3 documents take plain "title newline text" style).
-                texts.push(if c.context.is_empty() {
-                    c.text.clone()
-                } else {
-                    format!("{}\n{}", c.context, c.text)
-                });
-            }
-        }
-        let embeddings = match embedder.embed_documents(&texts, config.embed.max_batch_tokens) {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(error = %err, "batch embedding failed");
-                outcome.failed += pending.len();
-                pending.clear();
-                return Ok(());
-            }
-        };
-        let mut off = 0usize;
-        for p in pending.drain(..) {
-            let n = p.chunks.len();
-            let mut docs = Vec::with_capacity(n);
-            for (i, chunk) in p.chunks.iter().enumerate() {
-                docs.push(ChunkDoc {
-                    pk: format!("{}-{i}", p.loc),
-                    kind: p.kind,
-                    path: p.canon.clone(),
-                    root: p.root.clone(),
-                    rel_path: p.rel_path.clone(),
-                    title: p.title.clone(),
-                    text: chunk.text.clone(),
-                    chunk_index: i as u32,
-                    start_line: chunk.start_line,
-                    end_line: chunk.end_line,
-                    lang: p.lang.clone(),
-                    note_id: p.note_id.clone(),
-                    embedding: embeddings[off + i].clone(),
-                });
-            }
-            off += n;
-            if let Err(err) = store.upsert(&docs) {
-                tracing::warn!(path = %p.canon, error = %err, "upsert failed");
-                outcome.failed += 1;
-                continue;
-            }
-            state.files.insert(
-                p.canon.clone(),
-                FileSyncState {
-                    mtime_ms: p.mtime_ms,
-                    size: p.size,
-                    content_hash: p.content_hash.clone(),
-                    chunk_count: n as u32,
-                },
-            );
-            outcome.updated += 1;
-        }
-        Ok(())
     };
 
-    for found in &files {
-        outcome.scanned += 1;
-        if outcome.scanned % 10 == 0 {
-            tracing::info!(
-                scanned = outcome.scanned,
-                total = files.len(),
-                updated = outcome.updated,
-                "indexing progress"
-            );
-            report(progress, outcome.scanned, &outcome);
-        }
-        let canonical = dunce::canonicalize(&found.path).unwrap_or_else(|_| found.path.clone());
-        let Some(canon_str) = canonical.to_str() else {
-            outcome.failed += 1;
-            continue;
-        };
-        let Ok(meta) = std::fs::metadata(&found.path) else {
-            outcome.failed += 1;
-            continue;
-        };
-        let mtime_ms = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-
-        let prior = state.files.get(canon_str);
-        // Fast path: mtime + size unchanged.
-        if !force {
-            if let Some(p) = prior {
-                if p.mtime_ms == mtime_ms && p.size == meta.len() {
-                    outcome.unchanged += 1;
-                    continue;
+    std::thread::scope(|scope| -> Result<()> {
+        // ---- Stage C: store mutations, single consumer (ordered) ----
+        let store_handle = {
+            let store = &*store;
+            let state = &mut state;
+            let counters = &counters;
+            let rx = rx_b;
+            scope.spawn(move || {
+                let mut upsert_buf: Vec<ChunkDoc> = Vec::with_capacity(2048);
+                let mut pending_since_flush: usize = 0;
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        StoreMsg::Embedded { files, embeddings, failed } => {
+                            counters.failed.fetch_add(failed, Ordering::Relaxed);
+                            let mut off = 0usize;
+                            for p in files {
+                                let n = p.chunks.len();
+                                // Shrink-surplus delete must land before the
+                                // fresh upsert of the same pk range.
+                                if let Some(prior_n) = p.prior_chunk_count {
+                                    if prior_n > n as u32 {
+                                        let surplus: Vec<String> = (n as u32..prior_n)
+                                            .map(|i| format!("{}-{i}", p.loc))
+                                            .collect();
+                                        let _ = store.delete(&surplus);
+                                    }
+                                }
+                                upsert_buf.reserve(n);
+                                for (i, chunk) in p.chunks.iter().enumerate() {
+                                    upsert_buf.push(ChunkDoc {
+                                        pk: format!("{}-{i}", p.loc),
+                                        kind: p.kind,
+                                        path: p.canon.clone(),
+                                        root: p.root.clone(),
+                                        rel_path: p.rel_path.clone(),
+                                        title: p.title.clone(),
+                                        text: chunk.text.clone(),
+                                        chunk_index: i as u32,
+                                        start_line: chunk.start_line,
+                                        end_line: chunk.end_line,
+                                        lang: p.lang.clone(),
+                                        note_id: p.note_id.clone(),
+                                        embedding: embeddings[off + i].clone(),
+                                    });
+                                }
+                                off += n;
+                                state.files.insert(
+                                    p.canon.clone(),
+                                    FileSyncState {
+                                        mtime_ms: p.mtime_ms,
+                                        size: p.size,
+                                        content_hash: p.content_hash.clone(),
+                                        chunk_count: n as u32,
+                                    },
+                                );
+                                counters.updated.fetch_add(1, Ordering::Relaxed);
+                                // Large upserts, rare flushes: zvec's flush()
+                                // seals the vector-index block (alibaba/zvec
+                                // #869), so flushing per batch fragments the
+                                // index. Durability comes from the final
+                                // flush + sync_state; pk upserts are
+                                // idempotent after any mid-pass crash.
+                                if upsert_buf.len() >= 2048 {
+                                    if let Err(err) = store.upsert(&upsert_buf) {
+                                        tracing::warn!(error = %err, "upsert failed");
+                                        counters.failed.fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        counters.upserted_chunks.fetch_add(upsert_buf.len(), Ordering::Relaxed);
+                                    }
+                                    pending_since_flush += n;
+                                    if pending_since_flush >= 16384 {
+                                        let _ = store.flush();
+                                        pending_since_flush = 0;
+                                    }
+                                    upsert_buf.clear();
+                                }
+                            }
+                        }
+                        StoreMsg::Refresh(canon, fs) => {
+                            state.files.insert(canon, fs);
+                            counters.unchanged.fetch_add(1, Ordering::Relaxed);
+                        }
+                        StoreMsg::Dropped(canon, prior_n) => {
+                            let loc = locator_of(&canon);
+                            let pks: Vec<String> =
+                                (0..prior_n).map(|i| format!("{loc}-{i}")).collect();
+                            let _ = store.delete(&pks);
+                            state.files.remove(&canon);
+                            counters.updated.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
-            }
+                if !upsert_buf.is_empty() {
+                    if let Err(err) = store.upsert(&upsert_buf) {
+                        tracing::warn!(error = %err, "final upsert failed");
+                    } else {
+                        counters.upserted_chunks.fetch_add(upsert_buf.len(), Ordering::Relaxed);
+                    }
+                }
+                let _ = store.flush();
+            })
+        };
+
+        // ---- Stage B: GPU embedding (owns the embedder via &mut) ----
+        {
+            let embedder = &mut *embedder;
+            let tx_b = tx_b.clone();
+            let max_batch_tokens = config.embed.max_batch_tokens;
+            scope.spawn(move || {
+                let mut batch: Vec<PendingFile> = Vec::new();
+                let mut pending_chunks = 0usize;
+                while let Ok(msg) = rx_a.recv() {
+                    let pf = match msg {
+                        Produce::Batch(pf) => pf,
+                        Produce::Refresh(c, fs) => {
+                            let _ = tx_b.send(StoreMsg::Refresh(c, fs));
+                            continue;
+                        }
+                        Produce::Dropped(c, n) => {
+                            let _ = tx_b.send(StoreMsg::Dropped(c, n));
+                            continue;
+                        }
+                    };
+                    pending_chunks += pf.chunks.len();
+                    batch.push(pf);
+                    if pending_chunks >= EMBED_BATCH {
+                        flush_embed_batch(&batch, embedder, &tx_b, max_batch_tokens);
+                        batch.clear();
+                        pending_chunks = 0;
+                    }
+                }
+                if !batch.is_empty() {
+                    flush_embed_batch(&batch, embedder, &tx_b, max_batch_tokens);
+                }
+                // tx_b (clone) dropped here; the original in main drops at
+                // scope end → store thread's recv() terminates.
+            });
         }
 
-        let Ok(raw) = std::fs::read(&found.path) else {
-            outcome.failed += 1;
-            continue;
-        };
-        // Text detection, layer 3: files with a whitelisted extension can
-        // still be binary (renamed blobs, corrupt files). Sniff NUL bytes
-        // in the first 8KB — the classic heuristic — before UTF-8 decoding.
-        let head = &raw[..raw.len().min(8192)];
-        if head.contains(&0u8) {
-            outcome.skipped_binary += 1;
-            continue;
-        }
-        // Strip a UTF-8 BOM so it never leaks into chunks/embeddings.
-        let raw = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) { &raw[3..] } else { &raw[..] };
-        let text = match String::from_utf8(raw.to_vec()) {
-            Ok(t) => t,
-            Err(_) => {
-                // Non-UTF8 with a text extension: treat as binary, not failure.
-                outcome.skipped_binary += 1;
-                continue;
+        // ---- Stage A: N producer threads (IO + chunking) ----
+        {
+            // Read-only snapshot for the mtime/hash fast paths: stage C owns
+            // &mut state, so producers can't borrow the live map. Entries
+            // written by stage C during the pass are invisible here — fine,
+            // each file is produced exactly once per pass.
+            let state = &state_snapshot;
+            let counters = &counters;
+            let tx = &tx_a;
+            let chunk_params = &chunk_params;
+            let force = force;
+            let n_workers = std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(1).max(2))
+                .unwrap_or(4);
+            for _ in 0..n_workers {
+                let next = &next;
+                let files = &files;
+                scope.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= files.len() {
+                            return;
+                        }
+                        let found = &files[i];
+                        counters.scanned.fetch_add(1, Ordering::Relaxed);
+                        if let Err(err) = produce_one(found, state, force, chunk_params, tx) {
+                            tracing::warn!(path = %found.path.display(), error = %err, "produce failed");
+                            counters.failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
             }
-        };
-        let content_hash = {
-            let mut h = Sha256::new();
-            h.update(text.as_bytes());
-            format!("{:x}", h.finalize())
-        };
-        // Second level: mtime changed but content identical → refresh cache only.
+            // tx_a (borrow) released when all producers finish → Stage B
+            // drains → its tx_b clone drops → Stage C drains → scope joins.
+        }
+        drop(tx_b);
+        let _ = store_handle.join();
+        Ok(())
+    })?;
+
+    let outcome = counters.snapshot();
+    report(progress, &counters);
+    state.save(&sync_state_path(index_dir))?;
+    write_meta(index_dir, config)?;
+
+    // Merge the flat ingestion buffers into the configured HNSW index.
+    // zvec stages fresh vectors in brute-force buffers (fast to write, slow
+    // to search as they grow); optimize() folds them into the graph in the
+    // background — reads and writes continue during the merge. Skipped for
+    // small incremental passes (docs: consider at 100k+ unindexed docs; we
+    // threshold on a chunk count well below that to keep hybrid search
+    // fast after any meaningful pass).
+    if counters.upserted_chunks.load(Ordering::Relaxed) >= 10_000 {
+        tracing::info!(chunks = counters.upserted_chunks.load(Ordering::Relaxed), "optimizing vector index");
+        if let Err(err) = store.optimize() {
+            // Degraded, not failed: data is durable; queries just scan the
+            // flat buffers until a later pass optimizes.
+            tracing::warn!(error = %err, "zvec optimize failed — search runs on the flat buffer until the next pass");
+        }
+    }
+
+    Ok(outcome)
+}
+
+/// Stage A worker: read/validate/chunk one file, send it downstream.
+fn produce_one(
+    found: &crate::walk::FoundFile,
+    state: &SyncState,
+    force: bool,
+    chunk_params: &ChunkParams,
+    tx: &SyncSender<Produce>,
+) -> Result<()> {
+    let canonical = dunce::canonicalize(&found.path).unwrap_or_else(|_| found.path.clone());
+    let Some(canon_str) = canonical.to_str() else {
+        anyhow::bail!("non-UTF8 path");
+    };
+    let Ok(meta) = std::fs::metadata(&found.path) else {
+        anyhow::bail!("metadata failed");
+    };
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let prior = state.files.get(canon_str);
+    // Fast path: mtime + size unchanged → refresh state only.
+    if !force {
         if let Some(p) = prior {
-            if p.content_hash == content_hash {
-                state.files.insert(
+            if p.mtime_ms == mtime_ms && p.size == meta.len() {
+                tx.send(Produce::Refresh(
                     canon_str.to_string(),
                     FileSyncState {
                         mtime_ms,
                         size: meta.len(),
-                        content_hash,
+                        content_hash: p.content_hash.clone(),
                         chunk_count: p.chunk_count,
                     },
-                );
-                outcome.unchanged += 1;
-                continue;
+                )).ok();
+                return Ok(());
             }
-        }
-
-        let loc0 = locator_of(canon_str);
-        let _ = loc0;
-        let ext = found
-            .path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
-        let mut chunks = chunk_text_code(&text, ext, &chunk_params);
-        // Context prepend (embed-time): markdown gets the heading
-        // breadcrumb (mq path idea), code gets file path + language.
-        if chunks.is_empty() {
-            // nothing to contextualize
-        } else {
-            let ctx = if lang_is_markdown(&found.path) {
-                heading_breadcrumb(&text, chunks[0].start_line)
-            } else {
-                format!("{} [{}]", rel_path_of(&canonical, &found.root), ext_of(&found.path))
-            };
-            let budget = 600 * 4; // token budget * worst-case chars/token
-            crate::chunker::contextualize(&mut chunks, &ctx, budget);
-        }
-        if chunks.is_empty() {
-            // File became empty: drop old chunks if any.
-            if let Some(p) = prior {
-                let loc = locator_of(canon_str);
-                let pks: Vec<String> =
-                    (0..p.chunk_count).map(|i| format!("{loc}-{i}")).collect();
-                let _ = store.delete(&pks);
-            }
-            state.files.remove(canon_str);
-            outcome.updated += 1;
-            continue;
-        }
-
-        let loc = locator_of(canon_str);
-        let title = title_of(&text, &found.path);
-        let lang = found
-            .path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let rel_path = canonical
-            .strip_prefix(&found.root)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| canonical.to_string_lossy().to_string());
-
-        // Replacement semantics: delete surplus chunks when the file shrank.
-        if let Some(p) = prior {
-            if p.chunk_count > chunks.len() as u32 {
-                let surplus: Vec<String> = (chunks.len() as u32..p.chunk_count)
-                    .map(|i| format!("{loc}-{i}"))
-                    .collect();
-                let _ = store.delete(&surplus);
-            }
-        }
-
-        // Stage 1: queue this file; flush when the batch is big enough.
-        pending.push(PendingFile {
-            loc,
-            canon: canon_str.to_string(),
-            root: found.root.to_string_lossy().to_string(),
-            rel_path,
-            title: title.clone(),
-            lang,
-            kind: found.kind,
-            note_id: note_id_of(&title, found.kind),
-            mtime_ms,
-            size: meta.len(),
-            content_hash,
-            chunks,
-        });
-        pending_chunks += pending.last().unwrap().chunks.len();
-        if pending_chunks >= EMBED_BATCH {
-            flush(&mut pending, embedder, store, &mut state, &mut outcome)?;
-            pending_chunks = 0;
         }
     }
 
-    // Drain the final partial batch.
-    flush(&mut pending, embedder, store, &mut state, &mut outcome)?;
+    let Ok(raw) = std::fs::read(&found.path) else {
+        anyhow::bail!("read failed");
+    };
+    // Text detection, layer 3: NUL sniff in the first 8KB — binary files
+    // with whitelisted extensions are skipped, not failures.
+    let head = &raw[..raw.len().min(8192)];
+    if head.contains(&0u8) {
+        return Ok(());
+    }
+    let raw = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) { &raw[3..] } else { &raw[..] };
+    let text = match String::from_utf8(raw.to_vec()) {
+        Ok(t) => t,
+        Err(_) => return Ok(()),
+    };
+    let content_hash = {
+        let mut h = Sha256::new();
+        h.update(text.as_bytes());
+        format!("{:x}", h.finalize())
+    };
+    // Second level: mtime changed but content identical → refresh only.
+    if let Some(p) = prior {
+        if p.content_hash == content_hash {
+            tx.send(Produce::Refresh(
+                canon_str.to_string(),
+                FileSyncState {
+                    mtime_ms,
+                    size: meta.len(),
+                    content_hash,
+                    chunk_count: p.chunk_count,
+                },
+            )).ok();
+            return Ok(());
+        }
+    }
 
-    report(progress, outcome.scanned, &outcome);
-    state.save(&sync_state_path(index_dir))?;
-    write_meta(index_dir, config)?;
-    Ok(outcome)
+    let ext = found
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let mut chunks = chunk_text_code(&text, ext, chunk_params);
+    // Context prepend: markdown gets the heading breadcrumb, code gets
+    // file path + language.
+    if !chunks.is_empty() {
+        let ctx = if lang_is_markdown(&found.path) {
+            heading_breadcrumb(&text, chunks[0].start_line)
+        } else {
+            format!("{} [{}]", rel_path_of(&canonical, &found.root), ext_of(&found.path))
+        };
+        let budget = 600 * 4;
+        crate::chunker::contextualize(&mut chunks, &ctx, budget);
+    }
+    if chunks.is_empty() {
+        if let Some(p) = prior {
+            tx.send(Produce::Dropped(canon_str.to_string(), p.chunk_count)).ok();
+        }
+        return Ok(());
+    }
+
+    let loc = locator_of(canon_str);
+    let title = title_of(&text, &found.path);
+    let lang = found
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let rel_path = canonical
+        .strip_prefix(&found.root)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| canonical.to_string_lossy().to_string());
+
+    let embed_texts = chunks
+        .iter()
+        .map(|c| {
+            if c.context.is_empty() {
+                c.text.clone()
+            } else {
+                format!("{}\n{}", c.context, c.text)
+            }
+        })
+        .collect();
+
+    tx.send(Produce::Batch(PendingFile {
+        loc,
+        canon: canon_str.to_string(),
+        root: found.root.to_string_lossy().to_string(),
+        rel_path,
+        title: title.clone(),
+        lang,
+        kind: found.kind,
+        note_id: note_id_of(&title, found.kind),
+        mtime_ms,
+        size: meta.len(),
+        content_hash,
+        chunks,
+        embed_texts,
+        prior_chunk_count: prior.map(|p| p.chunk_count),
+    })).ok();
+    Ok(())
+}
+
+/// Stage B flush: embed one batch and hand results to the store thread.
+fn flush_embed_batch(
+    batch: &[PendingFile],
+    embedder: &mut QwenEmbedder,
+    tx_b: &SyncSender<StoreMsg>,
+    max_batch_tokens: usize,
+) {
+    let mut texts = Vec::with_capacity(batch.iter().map(|p| p.embed_texts.len()).sum::<usize>());
+    for p in batch.iter() {
+        texts.extend(p.embed_texts.iter().cloned());
+    }
+    match embedder.embed_documents(&texts, max_batch_tokens) {
+        Ok(embeddings) => {
+            let _ = tx_b.send(StoreMsg::Embedded {
+                files: batch.to_vec(),
+                embeddings,
+                failed: 0,
+            });
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, n_files = batch.len(), "batch embedding failed");
+            let _ = tx_b.send(StoreMsg::Embedded {
+                files: Vec::new(),
+                embeddings: Vec::new(),
+                failed: batch.len(),
+            });
+        }
+    }
 }
 
 /// Title: first markdown heading, else file name.

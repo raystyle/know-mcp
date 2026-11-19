@@ -53,7 +53,7 @@ async fn daemon_stdio_mcp_tools_list_and_search() {
         .await
         .expect("MCP handshake with daemon bridge");
 
-    // 1. tools/list: all 9 tools present.
+    // 1. tools/list: the 4 search/read/status/index tools present.
     let tools = client.list_tools(Default::default()).await.expect("tools/list");
     let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
     for expected in [
@@ -61,11 +61,6 @@ async fn daemon_stdio_mcp_tools_list_and_search() {
         "read_file",
         "get_status",
         "build_index",
-        "save_note",
-        "list_notes",
-        "get_note",
-        "record_feedback",
-        "get_gaps",
     ] {
         assert!(names.contains(&expected), "missing tool {expected} in {names:?}");
     }

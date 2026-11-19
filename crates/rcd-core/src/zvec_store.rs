@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use zvec_rust::{
     Collection, CollectionOptions, CollectionSchema, ConfigBuilder, DataType, Doc, FieldSchema, Fts,
-    FtsQueryParams, IndexParams, MetricType, MultiQuery, SearchQuery, SubQuery,
+    FtsQueryParams, HnswQueryParams, IndexParams, MetricType, MultiQuery, SearchQuery, SubQuery,
 };
 
 use crate::store::{ChunkDoc, Hit, SearchOptions, SearchStore};
@@ -27,9 +27,17 @@ fn ensure_initialized() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        // Engine thread budget: half the cores (min 2), so query/optimize
+        // workers don't starve the sync pipeline's producer threads (or vice
+        // versa). Applies to both query and optimize thread pools.
+        let threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(2) as u32)
+            .unwrap_or(4);
+        let config = ConfigBuilder::new()
+            .num_threads(threads)
+            .enable_console_log(false);
         // Idempotent per zvec docs; a second init returns "already" which we ignore.
-        let _ = zvec_rust::initialize(None);
-        let _ = ConfigBuilder::new().enable_console_log(false);
+        let _ = zvec_rust::initialize(Some(&config));
     });
 }
 
@@ -77,8 +85,14 @@ fn build_schema() -> Result<CollectionSchema> {
         .add_field(FieldSchema::new("end_line", DataType::Int64, false, 0)?)
         .add_field(FieldSchema::new("lang", DataType::String, false, 0)?)
         .add_field(FieldSchema::new("note_id", DataType::String, true, 0)?)
+        // Index-side INT8 quantization (storage stays FP32): 4x memory
+        // reduction on the HNSW graph and SIMD INT8 distance kernels —
+        // the same setup zvec's own benchmarks run (zvec.org
+        // /docs/db/benchmarks). Refiner at query time recomputes exact
+        // scores from the stored FP32 vectors to restore recall.
         .add_vector_field("embedding", DataType::VectorFp32, DIM,
-            IndexParams::hnsw(MetricType::Cosine, 16, 200)?)
+            IndexParams::hnsw_with_quantize(MetricType::Cosine, 16, 200,
+                zvec_rust::QuantizeType::Int8)?)
         .build()?)
 }
 
@@ -126,8 +140,16 @@ fn apply_common(query: &mut SearchQuery, opts: &SearchOptions) -> Result<()> {
 }
 
 impl SearchStore for ZvecStore {
+    /// Upsert in large batches WITHOUT flushing per call: zvec's flush()
+    /// seals the current vector-index block (alibaba/zvec#869), so frequent
+    /// small flushes fragment the index into many small blocks that slow
+    /// every query. Durability is provided by the caller via periodic
+    /// flush() — mid-pass crashes restart from sync_state anyway, and pk
+    /// upserts are idempotent.
     fn upsert(&self, docs: &[ChunkDoc]) -> Result<()> {
-        for batch in docs.chunks(32) {
+        // 1024-doc cap per call as a defensive upper bound for one native
+        // call (typical store batches are 512).
+        for batch in docs.chunks(1024) {
             let mut zdocs = Vec::with_capacity(batch.len());
             for chunk in batch {
                 let mut doc = Doc::new()?;
@@ -154,7 +176,6 @@ impl SearchStore for ZvecStore {
             self.collection
                 .upsert(&refs)
                 .with_context(|| "zvec upsert batch")?;
-            self.collection.flush()?;
         }
         Ok(())
     }
@@ -167,7 +188,6 @@ impl SearchStore for ZvecStore {
         self.collection
             .delete(&refs)
             .with_context(|| "zvec delete")?;
-        self.collection.flush()?;
         Ok(())
     }
 
@@ -197,6 +217,7 @@ impl SearchStore for ZvecStore {
     fn search_vector(&self, embedding: &[f32], opts: &SearchOptions) -> Result<Vec<Hit>> {
         let topk = topk_fetch(opts);
         let mut q = SearchQuery::new("embedding", embedding, topk as i32)?;
+        q.set_hnsw_params(hnsw_query_params(topk))?;
         apply_common(&mut q, opts)?;
         let docs = self.collection.query(&q)?;
         Ok(docs.iter().map(|d| doc_to_hit(d, 0.0)).collect())
@@ -208,6 +229,7 @@ impl SearchStore for ZvecStore {
         sub_vec.set_field_name("embedding")?;
         sub_vec.set_query_vector(embedding)?;
         sub_vec.set_num_candidates(topk as i32)?;
+        sub_vec.set_hnsw_params(hnsw_query_params(topk))?;
 
         let mut fts = Fts::new()?;
         fts.set_match_string(query)?;
@@ -233,4 +255,17 @@ impl SearchStore for ZvecStore {
 /// Over-fetch for Rust-side post-filtering (path prefix), capped at 50.
 fn topk_fetch(opts: &SearchOptions) -> usize {
     (opts.top_k.max(1) * 5).min(50)
+}
+
+/// HNSW query-time params: ef scaled past the fetch width (docs recommend
+/// raising ef when recall is short) and the refiner ON — the index is INT8
+/// quantized, so exact scores are recomputed from stored FP32 vectors to
+/// restore ranking precision (same setup as zvec's published benchmarks).
+fn hnsw_query_params(topk: usize) -> HnswQueryParams {
+    HnswQueryParams::new(
+        (topk as i32 * 4).clamp(64, 300),
+        0.0,
+        false,
+        true,
+    )
 }

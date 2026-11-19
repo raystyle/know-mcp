@@ -91,43 +91,8 @@ pub fn daemon_stopping() {
     );
 }
 
-/// Index pass progress — polled by tests as indexing evidence.
-pub fn index_progress(scanned: usize, total: usize, updated: usize, failed: usize) {
-    tracing::debug!(
-        event = "index.progress",
-        subsystem = "index",
-        outcome = "ok",
-        scanned,
-        total,
-        updated,
-        failed,
-        "indexing progress"
-    );
-}
-
-pub fn index_complete(scanned: usize, updated: usize, unchanged: usize, deleted: usize, failed: usize, duration_ms: u128) {
-    let outcome = if failed > 0 { "error" } else { "ok" };
-    if failed > 0 {
-        tracing::warn!(
-            event = "index.complete",
-            subsystem = "index",
-            outcome,
-            scanned, updated, unchanged, deleted, failed, duration_ms,
-            "index pass complete"
-        );
-    } else {
-        tracing::info!(
-            event = "index.complete",
-            subsystem = "index",
-            outcome,
-            scanned, updated, unchanged, deleted, failed, duration_ms,
-            "index pass complete"
-        );
-    }
-}
-
-/// Search completed — the acceptance evidence line (mode + hits + gap flag).
-pub fn search_complete(mode: &str, hits: usize, top_score: f32, gap_recorded: bool, duration_ms: u128) {
+/// Search completed — the acceptance evidence line (mode + hits).
+pub fn search_complete(mode: &str, hits: usize, top_score: f32, duration_ms: u128) {
     tracing::info!(
         event = "search.complete",
         subsystem = "search",
@@ -135,7 +100,6 @@ pub fn search_complete(mode: &str, hits: usize, top_score: f32, gap_recorded: bo
         mode,
         hits,
         top_score = format!("{top_score:.3}"),
-        gap_recorded,
         duration_ms,
         "search completed"
     );

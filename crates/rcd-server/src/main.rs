@@ -48,9 +48,6 @@ enum Command {
         /// Re-embed every file regardless of sync state.
         #[arg(long)]
         force: bool,
-        /// Run zvec optimize after indexing (opt-in; known to be fragile).
-        #[arg(long)]
-        optimize: bool,
     },
     /// Debug search from the CLI.
     Search {
@@ -61,11 +58,6 @@ enum Command {
         top_k: usize,
         #[arg(long)]
         path: Option<String>,
-    },
-    /// Notes inspection: list or show with feedback scores.
-    Note {
-        #[command(subcommand)]
-        action: NoteAction,
     },
     /// Register this server as a native CLI: `rcd-cli` (via mcp2cli binding).
     #[command(name = "register")]
@@ -80,12 +72,6 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum NoteAction {
-    List,
-    Show { id: String },
 }
 
 #[tokio::main]
@@ -108,11 +94,10 @@ async fn main() -> Result<()> {
         Command::Http => client::run_mcp_http(cli.config).await,
         Command::Stop => client::run_stop(cli.config).await,
         Command::Status => client::run_status(cli.config).await,
-        Command::Index { force, optimize } => client::run_index(cli.config, force, optimize).await,
+        Command::Index { force } => client::run_index(cli.config, force).await,
         Command::Search { query, mode, top_k, path } => {
             client::run_search(cli.config, query, mode, top_k, path).await
         }
-        Command::Note { action } => client::run_note(cli.config, action).await,
         Command::Mcp2Cli { transport, endpoint, force } => {
             client::run_mcp2cli(cli.config, transport, endpoint, force).await
         }
@@ -165,8 +150,11 @@ fn configure_lib_search_path() {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    // SAFETY: pointer is a valid NUL-terminated wide string from the collect
+    // above; SetDllDirectoryW only reads it. Best effort: a missing directory
+    // is reported by the loader later.
+    #[allow(unsafe_code)]
     unsafe {
-        // Best effort: a missing directory is reported by the loader later.
         windows_sys::Win32::System::LibraryLoader::SetDllDirectoryW(wide.as_ptr());
     }
 }

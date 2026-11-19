@@ -51,18 +51,14 @@ pub async fn run_stop(_config: Option<PathBuf>) -> Result<()> {
     anyhow::bail!("daemon did not stop within 15s");
 }
 
-pub async fn run_index(config: Option<PathBuf>, force: bool, optimize: bool) -> Result<()> {
+pub async fn run_index(config: Option<PathBuf>, force: bool) -> Result<()> {
     if is_daemon_listening() {
         let response = admin_request("reindex", json!({"force": force}))?;
         println!("reindex started on daemon: {}", response["result"]);
-        if optimize {
-            println!("note: optimize runs on the daemon side at the end of the pass");
-        }
         return Ok(());
     }
     // Foreground: no daemon — index directly.
     let config = rcd_core::config::Config::load(config.as_deref())?;
-    use rcd_core::store::SearchStore as _;
     let store = rcd_core::zvec_store::ZvecStore::open(&config.storage.index_dir)?;
     let mut embedder = rcd_core::embed::QwenEmbedder::load(
         &config.embed.gguf_path,
@@ -85,9 +81,6 @@ pub async fn run_index(config: Option<PathBuf>, force: bool, optimize: bool) -> 
         "indexed: {} scanned, {} updated, {} unchanged, {} deleted, {} failed, {} binary-skipped",
         outcome.scanned, outcome.updated, outcome.unchanged, outcome.deleted, outcome.failed, outcome.skipped_binary
     );
-    if optimize {
-        store.optimize().context("zvec optimize (known to be fragile on some volumes)")?;
-    }
     Ok(())
 }
 
@@ -126,27 +119,6 @@ pub async fn run_search(
             hit["end_line"].as_u64().unwrap_or(0),
             hit["title"].as_str().unwrap_or(""),
         );
-    }
-    if result["gap_recorded"].as_bool() == Some(true) {
-        println!("(gap recorded: no hit scored above threshold)");
-    }
-    Ok(())
-}
-
-pub async fn run_note(config: Option<PathBuf>, action: crate::NoteAction) -> Result<()> {
-    ensure_daemon(config.as_deref())?;
-    match action {
-        crate::NoteAction::List => {
-            let response = admin_request("list_notes", json!({}))?;
-            println!("{}", serde_json::to_string_pretty(&response["result"])?);
-        }
-        crate::NoteAction::Show { id } => {
-            let response = admin_request("get_note", json!({"id": id}))?;
-            if let Some(err) = response.get("error").and_then(|e| e.as_str()) {
-                anyhow::bail!("{err}");
-            }
-            println!("{}", serde_json::to_string_pretty(&response["result"])?);
-        }
     }
     Ok(())
 }
@@ -224,7 +196,6 @@ pub async fn run_mcp2cli(
     println!("registered: mcp2cli config `rcd-cli` + `rcd-cli` command");
     println!("try: rcd-cli get-status          # daemon/index status");
     println!("     rcd-cli search-content --query \"混合检索\" --mode hybrid");
-    println!("     rcd-cli save-note --title ... --body ...");
     Ok(())
 }
 

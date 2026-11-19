@@ -59,14 +59,12 @@ pub enum EmbedPurpose {
 }
 
 /// The Qwen3-Embedding model over llama.cpp. Loaded once per process;
-/// callers keep it behind a `Mutex`.
+/// callers keep it behind a `Mutex`. Send/Sync come for free: llama-cpp-2's
+/// LlamaModel already implements both.
 pub struct QwenEmbedder {
     model: LlamaModel,
     n_threads: i32,
 }
-
-unsafe impl Send for QwenEmbedder {}
-unsafe impl Sync for QwenEmbedder {}
 
 /// Crate-wide llama backend singleton (llama.cpp global init is once-only).
 static BACKEND: std::sync::OnceLock<LlamaBackend> = std::sync::OnceLock::new();

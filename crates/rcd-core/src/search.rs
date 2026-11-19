@@ -1,10 +1,8 @@
-//! Search service: auto mode routing, path post-filter, note reweighting by
-//! feedback score, snippet assembly, gap accounting.
+//! Search service: auto mode routing, path post-filter, snippet assembly.
 
 use anyhow::Result;
 
 use crate::embed::{EmbedPurpose, QwenEmbedder};
-use crate::feedback::Feedback;
 use crate::store::{Hit, SearchMode, SearchOptions, SearchStore};
 use crate::Kind;
 
@@ -24,13 +22,7 @@ pub struct SearchResult {
     pub query: String,
     pub mode: &'static str,
     pub hits: Vec<Hit>,
-    /// Recorded when nothing scored above the gap threshold.
-    pub gap_recorded: bool,
 }
-
-/// Gap threshold on the best cosine similarity: below this we consider the
-/// query unserved and record it for get_gaps.
-const GAP_THRESHOLD: f32 = 0.15;
 
 /// Auto-mode heuristic: identifier-like tokens or heavy CJK → keyword
 /// (FTS exact tokens beat embeddings there); otherwise hybrid.
@@ -55,7 +47,6 @@ pub fn resolve_mode(query: &str) -> SearchMode {
 pub struct SearchService<'a> {
     pub store: &'a dyn SearchStore,
     pub embedder: &'a mut QwenEmbedder,
-    pub feedback: &'a Feedback,
 }
 
 impl<'a> SearchService<'a> {
@@ -78,17 +69,6 @@ impl<'a> SearchService<'a> {
             }
         };
 
-        // Note reweighting: helpful notes rank up, unhelpful ones down.
-        for hit in &mut hits {
-            if hit.kind == Kind::Note {
-                if let Some(note_id) = &hit.note_id {
-                    let score = self.feedback.helpful_score(note_id);
-                    let factor = (1.0 + 0.1 * score as f32).clamp(0.5, 2.0);
-                    hit.score *= factor;
-                }
-            }
-        }
-
         // Path post-filter.
         if let Some(filter) = &req.path_filter {
             let f = filter.to_lowercase();
@@ -98,17 +78,10 @@ impl<'a> SearchService<'a> {
         hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         hits.truncate(req.top_k);
 
-        let best = hits.first().map(|h| h.score).unwrap_or(0.0);
-        let gap_recorded = hits.is_empty() || best < GAP_THRESHOLD;
-        if gap_recorded {
-            self.feedback.record_gap(&req.query, mode.as_str());
-        }
-
         Ok(SearchResult {
             query: req.query.clone(),
             mode: mode.as_str(),
             hits,
-            gap_recorded,
         })
     }
 }
