@@ -21,16 +21,16 @@
 │    stdio 桥 (know-mcp stdio)        HTTP (know-mcp http → /mcp)
 │    原生 CLI (know-mcp register → know-cli <verb>)
 ▼
-┌─ daemon (know-mcp daemon, 后台常驻, 单实例)
-│  ├─ JSON 管理面 (local socket: named pipe / UDS)
+┌─ daemon (know-mcp daemon, 后台常驻, 单实例, 启动秒级)
+│  ├─ JSON 管理面 (TCP loopback + admin.port 文件)
 │  ├─ zvec collection (HNSW INT8 向量 + jieba FTS + 引擎级 RRF 混合)
-│  ├─ Qwen3-Embedding-0.6B ×2 (索引线程 + 查询线程, llama.cpp, GPU 自适应)
-│  ├─ 增量索引 (三段流水线: producer×N → GPU embed → store)
+│  ├─ Qwen3-Embedding-0.6B (懒加载: 索引/查询各自首次使用时加载, llama.cpp, GPU 自适应)
+│  ├─ 索引任务 (显式触发: build_index / manage_index add_root; 三段流水线 producer×N → GPU embed → store)
 │  └─ 索引锁 (daemon.lock 原子互斥 + PID 存活检测接管)
 └─ CLI: status / stop / index / search (都走 daemon)
 ```
 
-## MCP 工具（4 个）
+## MCP 工具（5 个）
 
 | 工具 | 说明 |
 |---|---|
@@ -38,6 +38,73 @@
 | `read_file` | 带行号读取（roots 白名单校验，2000 行/256KB 上限） |
 | `get_status` | 索引/进度状态 |
 | `build_index` | 触发增量重索引（force=true 全量重嵌入） |
+| `manage_index` | 索引管理：查/加/删索引目录、清空索引（详见下表） |
+
+## 工具参数详解
+
+### `search_content` — 查索引（检索）
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `query` | string | ✓ | 查询文本（中英文、关键词或自然语言） |
+| `mode` | string | | `"auto"`（默认）/ `"keyword"`（FTS，适合标识符/CVE号/中文）/ `"vector"`（语义）/ `"hybrid"`（RRF 融合，默认走 auto 时选） |
+| `top_k` | int | | 最多返回条数，默认 10 |
+| `path_filter` | string | | 文件路径大小写不敏感子串过滤，如 `"zvec"` 只搜 zvec 相关路径 |
+
+返回每条 hit 含 `path`（绝对路径）、`rel_path`、`title`、`score`、`start_line`/`end_line`（配合 `read_file` 取精确上下文）、`snippet`。
+
+### `manage_index` — 指定目录建索引 / 查索引范围 / 删索引
+
+`allowed_roots` 是配置文件里的授权边界；`add_root` 只能激活边界内的目录，边界外的路径一律拒绝。
+
+| action | 额外参数 | 行为 |
+|---|---|---|
+| `list_roots` | — | 返回当前激活的 `roots` 与授权边界 `allowed_roots` |
+| `add_root` | `path`（目录） | 激活一个目录并**立即触发索引**；新目录必须落在 `allowed_roots` 内，否则报错；写入 know-mcp.toml 持久化 |
+| `remove_root` | `path`（目录） | 停用该目录并**删除其全部已索引数据**；同步回写配置 |
+| `drop` | `confirm: true` | 清空**全部**索引数据（collection + sync state）；不带 confirm 会被拒绝；daemon 继续运行，之后可 rebuild |
+
+示例（MCP 客户端视角）：
+
+```jsonc
+// 查当前索引了哪些目录
+{"action": "list_roots"}
+// → {"roots": ["E:/resources/code_repos"], "allowed_roots": ["E:/resources/..."]}
+
+// 指定一个新目录建索引（必须在 allowed_roots 内）
+{"action": "add_root", "path": "E:/resources/docments"}
+
+// 删除某目录的索引
+{"action": "remove_root", "path": "E:/resources/docments"}
+
+// 清空整个索引
+{"action": "drop", "confirm": true}
+```
+
+### `build_index` — 重跑索引任务
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `force` | bool | | `true` = 忽略 mtime/哈希快路径，**全量重新嵌入**（换模型/改分块参数后用）；缺省 `false` = 增量（只处理变更文件） |
+
+索引任务在 daemon 后台执行，用 `get_status` 轮询进度（`progress.running` / `scanned` / `total`）。索引模型懒加载：daemon 启动秒级就绪，首个索引/检索任务才加载嵌入模型。
+
+### `get_status` — 查索引状态
+
+无参数。返回：
+
+```jsonc
+{
+  "doc_count": 1234,             // 已索引文档数
+  "model": "qwen3-embedding-0.6b",
+  "roots": ["..."],              // 当前激活的索引目录
+  "index_dir": "...",            // 索引存储位置
+  "progress": {                  // 后台索引任务进度
+    "running": true, "scanned": 100, "total": 500,
+    "updated": 90, "deleted": 3, "failed": 0, "started_at": "..."
+  }
+}
+```
 
 ## 快速开始
 
@@ -109,25 +176,27 @@ know-mcp stop      # 停守护
 
 - daemon 日志：`%APPDATA%\know-mcp\daemon.log`（Windows）或 index_dir 下 `daemon.log`
 - 单实例：`daemon.lock` 原子 create_new 互斥；陈旧锁按 PID 存活检测自动接管
-- 冷启动：首次工具调用自动拉起 daemon 并等待就绪（模型加载可到数分钟）；之后的调用即时
+- 冷启动：daemon 秒级就绪（**懒加载**——模型在首个索引任务或向量搜索时才载入，一次性 ~30-60s）；首次工具调用自动拉起 daemon
 - 依赖库路径：`.env` 里 `KNOW_LIB_DIR` 指向 DLL 目录（Windows 经 SetDllDirectoryW 注入加载器）
 
 ## 构建依赖
 
 - Rust 1.98+ / MSVC 工具链
-- **zvec C 库**：`zvec-rust` bundled 特性构建时自动下载预编译 DLL；离线时手动下载 `zvec-prebuilt-x86_64-pc-windows-msvc.tar.gz` 解压设 `ZVEC_LIB_DIR`
+- **zvec C 库**：预编译库已归档在 `vendor/zvec-lib`（`source scripts/env.sh` 自动设 `ZVEC_LIB_DIR`），构建零网络依赖；换平台时从 [zvec-rust releases](https://github.com/zvec-ai/zvec-rust/releases) 下载对应 prebuilt 包替换
 - **llama.cpp**（llama-cpp-2 crate，git rev `0364f5da`，源码编译）：需 cmake 与 LLVM（bindgen 用 libclang）；构建环境见 `scripts/env.sh`（`CMAKE_GENERATOR=Ninja` + `LIBCLANG_PATH` + CUDA 13.5 显式指定）
-- **嵌入模型**：Qwen3-Embedding-0.6B Q8_0 GGUF，从 [Qwen/Qwen3-Embedding-0.6B-GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF) 下载
+- **嵌入模型**：Qwen3-Embedding-0.6B Q8_0 GGUF 放 `models/`（gitignore），从 [Qwen/Qwen3-Embedding-0.6B-GGUF](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF) 下载
 - **GPU（可选）**：CUDA Toolkit 13.5 + llama-cpp-2 `cuda-no-vmm` feature；首次索引小时级 → 分钟级
 
 ## 开发
 
 ```bash
-cargo test -p know-core        # 单测 + zvec 集成测试（嵌入冒烟需本地模型，缺失自动跳过）
-cargo test -p know-server      # daemon e2e + 互斥回归 + 冷启动 e2e
-bash scripts/build.sh lint     # clippy -D warnings --no-deps + 项目禁令
-bash scripts/build.sh release  # 发布构建（thin-LTO）
+just ci          # 完整门禁: fmt → clippy(-D warnings) → nextest
+just test        # 测试 (nextest: 进程隔离 + slow-timeout 兜底)
+just lint        # clippy -D warnings --all-targets
+just build       # 发布构建 (thin-LTO)
 ```
+
+测试观测：`test-support` crate 的 `with_phase(name, budget, f)` 提供阶段级时间预算断言 + `[phase]` 证据日志；`.config/nextest.toml` 配 slow-timeout/terminate-after（hang 即杀）与 CI profile（retries + JUnit）。首次运行需 `cargo install cargo-nextest` 与 `cargo install just`。
 
 项目专属 Lint：`clippy.toml` 的 `disallowed-methods` 禁用开发中踩过坑的 API（`embeddings_ith` / `delete_by_filter`），每条注明原因，随 `cargo clippy` 一起跑。
 
