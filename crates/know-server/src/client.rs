@@ -207,6 +207,79 @@ pub async fn run_mcp2cli(
     Ok(())
 }
 
+/// CLI read: no roots allowlist check (unlike the MCP tool) — the CLI
+/// runs as the local user with the user's own filesystem rights; the
+/// MCP guard exists for untrusted client input, not for the operator.
+pub async fn run_read(
+    config: Option<PathBuf>,
+    path: String,
+    start_line: Option<u64>,
+    end_line: Option<u64>,
+) -> Result<()> {
+    ensure_daemon(config.as_deref())?;
+    let canonical = dunce::canonicalize(&path)
+        .with_context(|| format!("cannot resolve path {path}"))?;
+    let content = std::fs::read_to_string(&canonical)
+        .with_context(|| format!("reading {}", canonical.display()))?;
+    let start = start_line.unwrap_or(1).max(1);
+    let end = end_line.unwrap_or(start + 2000 - 1).min(start + 2000 - 1);
+    let mut taken: usize = 0;
+    for (i, line) in content.lines().enumerate() {
+        let n = (i + 1) as u64;
+        if n < start {
+            continue;
+        }
+        if n > end {
+            break;
+        }
+        println!("{n:>6}	{line}");
+        taken += line.len() + 8;
+        if taken > 256 * 1024 {
+            println!("... (truncated at 256KB)");
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// manage_index CLI: same actions as the MCP tool, over the admin plane.
+pub async fn run_manage(config: Option<PathBuf>, action: crate::ManageAction) -> Result<()> {
+    ensure_daemon(config.as_deref())?;
+    let (method_params, payload_key) = match action {
+        crate::ManageAction::ListRoots => {
+            (json!({"action": "list_roots"}), "roots")
+        }
+        crate::ManageAction::AddRoot { path } => {
+            (json!({"action": "add_root", "path": path}), "added")
+        }
+        crate::ManageAction::RemoveRoot { path } => {
+            (json!({"action": "remove_root", "path": path}), "removed")
+        }
+        crate::ManageAction::Drop { confirm } => {
+            (json!({"action": "drop", "confirm": confirm}), "dropped")
+        }
+    };
+    let response = admin_request("manage_index", method_params)?;
+    if let Some(err) = response.get("error").and_then(|e| e.as_str()) {
+        anyhow::bail!("manage_index failed: {err}");
+    }
+    let result = &response["result"];
+    match payload_key {
+        "roots" => {
+            println!("active roots:");
+            for r in result["roots"].as_array().cloned().unwrap_or_default() {
+                println!("  {}", r.as_str().unwrap_or("?"));
+            }
+            println!("allowed_roots (authorization boundary):");
+            for r in result["allowed_roots"].as_array().cloned().unwrap_or_default() {
+                println!("  {}", r.as_str().unwrap_or("?"));
+            }
+        }
+        _ => println!("{}", serde_json::to_string_pretty(result)?),
+    }
+    Ok(())
+}
+
 fn which_mcp2cli() -> Option<PathBuf> {
     let name = if cfg!(windows) {
         "mcp2cli.exe"

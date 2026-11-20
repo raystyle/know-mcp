@@ -1,12 +1,12 @@
 # know-mcp
 
-> 本地**代码搜索 + 文档搜索** MCP server —— 对归档的代码仓库和文档做关键字 + 向量语义混合检索，带行号读取，本地推理零外发。
+> 本地**代码搜索 + 文档搜索** MCP server：对归档的代码仓库和文档做关键字 + 向量语义混合检索，带行号读取，本地推理零外发。
 
-一次构建，三种消费形态：**MCP server**（Claude Code / 任何 MCP 客户端）、**原生 CLI**（`know-mcp register` 一键注册）、**HTTP 服务**（多客户端共享）。
+一次构建，**MCP** 三种消费形态：**MCP STDIO**（`know-mcp stdio`，Claude Code 等本地客户端）、**MCP HTTP**（`know-mcp http`，多客户端网络共享）、**MCP2CLI**（`know-mcp register` 一键注册，MCP 工具转译为原生命令 `know-cli`）。
 
 ## 功能
 
-- **混合检索**：zvec 引擎内融合——HNSW 向量（Qwen3-Embedding-0.6B，1024 维，INT8 量化索引 + refiner 精排）+ jieba 中文分词 FTS + RRF 重排；`auto` 模式按查询形态自动路由（标识符/中文 → 关键字，自然语言 → 混合）
+- **混合检索**：zvec 引擎内融合（HNSW 向量（Qwen3-Embedding-0.6B，1024 维，INT8 量化索引 + refiner 精排）+ jieba 中文分词 FTS + RRF 重排）；`auto` 模式按查询形态自动路由（标识符/中文 → 关键字，自然语言 → 混合）
 - **代码感知分块**：token 预算自适应 CJK + tree-sitter AST 边界；代码 chunk 带 `rel_path [lang]` 上下文，markdown 带 heading breadcrumb 上下文
 - **daemon 常驻**：探测-拉起-等就绪（冷启动自动拉起，首调用等待就绪）；索引常驻内存，多客户端共享；create_new 锁文件单实例互斥（并发拉起恰好一个赢）
 - **增量索引**：mtime+size 快路径 → 内容哈希 → 确定性 chunk id 替换；二次运行秒级
@@ -17,9 +17,10 @@
 ## 架构
 
 ```
-┌─ MCP 客户端 (Claude Code / Desktop / 任意 MCP host)
-│    stdio 桥 (know-mcp stdio)        HTTP (know-mcp http → /mcp)
-│    原生 CLI (know-mcp register → know-cli <verb>)
+┌─ MCP 客户端
+│  形态一 STDIO:  know-mcp stdio      (Claude Code 等本地客户端)
+│  形态二 HTTP:   know-mcp http       (→ /mcp, 多客户端共享)
+│  形态三 CLI:    know-mcp register   (mcp2cli 转译为 know-cli <verb>)
 ▼
 ┌─ daemon (know-mcp daemon, 后台常驻, 单实例, 启动秒级)
 │  ├─ JSON 管理面 (TCP loopback + admin.port 文件)
@@ -115,7 +116,7 @@ cp know-mcp.toml.example know-mcp.toml   # 编辑：roots / 模型路径 / index
 ./target/release/know-mcp search "hybrid search"   # 冒烟
 ```
 
-### 接入 Claude Code
+### 形态一：MCP STDIO（本地客户端，如 Claude Code）
 
 ```bash
 claude mcp add know-search -- <repo>/target/release/know-mcp stdio
@@ -129,7 +130,13 @@ claude mcp add know-search -- <repo>/target/release/know-mcp stdio
     "args": ["stdio"] } } }
 ```
 
-### 注册为原生 CLI（mcp2cli 绑定）
+### 形态二：MCP HTTP（多客户端网络共享）
+
+```bash
+know-mcp http    # http://127.0.0.1:8765/mcp（挂 daemon）
+```
+
+### 形态三：MCP2CLI（注册为原生命令）
 
 ```bash
 # 前置：安装 mcp2cli（一次性）
@@ -142,20 +149,25 @@ know-cli get-status
 know-cli search-content --query "混合检索" --mode hybrid
 ```
 
-### HTTP 模式
-
-```bash
-know-mcp http    # http://127.0.0.1:8765/mcp（挂 daemon，多客户端共享）
-```
-
 ### CLI 速查
 
 ```
-know-mcp daemon    # 显式启动守护（通常无需——其他命令自动拉起）
-know-mcp status    # 状态
-know-mcp index     # 建库（--force 全量重嵌入）
-know-mcp search    # 检索（--mode auto|keyword|vector|hybrid --top-k --path）
-know-mcp stop      # 停守护
+know-mcp daemon        # 显式启动守护（通常无需，其他命令自动拉起）
+know-mcp status        # 状态（doc_count / roots / 进度）
+know-mcp index         # 建库（--force 全量重嵌入）
+know-mcp search        # 检索（--mode auto|keyword|vector|hybrid --top-k --path）
+know-mcp read          # 带行号读文件（--start-line --end-line）
+know-mcp manage        # 索引管理（与 manage_index MCP 工具对齐）
+know-mcp stop          # 停守护
+```
+
+`manage` 子命令与 MCP 工具完全对齐：
+
+```bash
+know-mcp manage list-roots                  # 查激活目录 + 授权边界
+know-mcp manage add-root E:/resources/docs  # 指定目录建索引（须在 allowed_roots 内）
+know-mcp manage remove-root E:/resources/docs
+know-mcp manage drop --confirm              # 清空全部索引
 ```
 
 ## 配置（know-mcp.toml）
@@ -176,7 +188,7 @@ know-mcp stop      # 停守护
 
 - daemon 日志：`%APPDATA%\know-mcp\daemon.log`（Windows）或 index_dir 下 `daemon.log`
 - 单实例：`daemon.lock` 原子 create_new 互斥；陈旧锁按 PID 存活检测自动接管
-- 冷启动：daemon 秒级就绪（**懒加载**——模型在首个索引任务或向量搜索时才载入，一次性 ~30-60s）；首次工具调用自动拉起 daemon
+- 冷启动：daemon 秒级就绪（**懒加载**：模型在首个索引任务或向量搜索时才载入，一次性 ~30-60s）；首次工具调用自动拉起 daemon
 - 依赖库路径：`.env` 里 `KNOW_LIB_DIR` 指向 DLL 目录（Windows 经 SetDllDirectoryW 注入加载器）
 
 ## 构建依赖

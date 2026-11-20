@@ -63,6 +63,19 @@ enum Command {
         #[arg(long)]
         path: Option<String>,
     },
+    /// Read a file under the configured roots with line numbers.
+    Read {
+        path: String,
+        #[arg(long)]
+        start_line: Option<u64>,
+        #[arg(long)]
+        end_line: Option<u64>,
+    },
+    /// Index management (mirrors the manage_index MCP tool).
+    Manage {
+        #[command(subcommand)]
+        action: ManageAction,
+    },
     /// Register this server as a native CLI: `know-cli` (via mcp2cli binding).
     #[command(name = "register")]
     Mcp2Cli {
@@ -75,6 +88,22 @@ enum Command {
         /// Overwrite an existing named config.
         #[arg(long)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ManageAction {
+    /// List active index roots and the allowed_roots boundary.
+    ListRoots,
+    /// Activate a directory for indexing (must be inside allowed_roots).
+    AddRoot { path: String },
+    /// Deactivate a root and delete its indexed data.
+    RemoveRoot { path: String },
+    /// Drop ALL index data (collection + sync state).
+    Drop {
+        /// Required safety confirmation.
+        #[arg(long)]
+        confirm: bool,
     },
 }
 
@@ -105,6 +134,12 @@ async fn main() -> Result<()> {
             top_k,
             path,
         } => client::run_search(cli.config, query, mode, top_k, path).await,
+        Command::Read {
+            path,
+            start_line,
+            end_line,
+        } => client::run_read(cli.config, path, start_line, end_line).await,
+        Command::Manage { action } => client::run_manage(cli.config, action).await,
         Command::Mcp2Cli {
             transport,
             endpoint,
