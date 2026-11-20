@@ -8,24 +8,24 @@ source scripts/env.sh
 
 BIN="${1:---debug}"
 case "$BIN" in
-  --release) EXE=target/release/rcd-mcp ;;
-  *) EXE=target/debug/rcd-mcp ;;
+  --release) EXE=target/release/know-mcp ;;
+  *) EXE=target/debug/know-mcp ;;
 esac
 [[ -f "$EXE" ]] || { echo "FAIL: $EXE not built" >&2; exit 1; }
 
 # Isolated environment: own config, own socket, own index dir.
-SMOKE="$(cygpath -m "${TEMP:-/c/Windows/Temp}")/rcd-smoke-$$"
+SMOKE="$(cygpath -m "${TEMP:-/c/Windows/Temp}")/know-smoke-$$"
 mkdir -p "$SMOKE"
 cleanup() {
-    "$EXE" --config "$SMOKE/rcd-mcp.toml" stop >/dev/null 2>&1 || true
+    "$EXE" --config "$SMOKE/know-mcp.toml" stop >/dev/null 2>&1 || true
     sleep 2
     rm -rf "$SMOKE" 2>/dev/null || true
 }
 trap cleanup EXIT
-export RCD_PORT_DIR="$SMOKE/portdir"
-export RUST_LOG="rcd_mcp=debug,rcd_core=debug"
-LOG="$APPDATA/rcd-mcp/daemon.log"
-mkdir -p "$RCD_PORT_DIR"
+export KNOW_PORT_DIR="$SMOKE/portdir"
+export RUST_LOG="know_mcp=debug,know_core=debug"
+LOG="$APPDATA/know-mcp/daemon.log"
+mkdir -p "$KNOW_PORT_DIR"
 FIXTURE="$SMOKE/corpus"
 mkdir -p "$FIXTURE/code" "$FIXTURE/docs" "$FIXTURE/knowledge"
 
@@ -39,8 +39,8 @@ cat > "$FIXTURE/docs/hybrid.md" <<'EOF'
 混合检索融合 BM25 关键字与向量语义，RRF 排序融合。
 EOF
 
-MODEL=$(python -c "import tomllib;print(tomllib.load(open('rcd-mcp.toml','rb'))['embed']['gguf_path'])" 2>/dev/null || true)
-cat > "$SMOKE/rcd-mcp.toml" <<EOF
+MODEL=$(python -c "import tomllib;print(tomllib.load(open('know-mcp.toml','rb'))['embed']['gguf_path'])" 2>/dev/null || true)
+cat > "$SMOKE/know-mcp.toml" <<EOF
 [index]
 roots = ["$FIXTURE/code", "$FIXTURE/docs"]
 [notes]
@@ -55,7 +55,7 @@ index_dir = "$SMOKE/index"
 http_bind = "127.0.0.1:18765"
 EOF
 
-CONFIG_ARGS=(--config "$SMOKE/rcd-mcp.toml")
+CONFIG_ARGS=(--config "$SMOKE/know-mcp.toml")
 
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1" >&2; exit 1; }

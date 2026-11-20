@@ -1,0 +1,16 @@
+# nextest profiles: local default + CI gate.
+# Process-per-test isolation catches the daemon-leak class of bug that
+# cargo test's shared-process model hides (one leaked daemon poisoned
+# every later test's port file).
+
+[profile.default]
+# Two phases over budget in a row = hang, kill it loudly.
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+[profile.ci]
+fail-fast = false
+retries = 2
+slow-timeout = { period = "120s", terminate-after = 3 }
+
+[profile.ci.junit]
+path = "junit.xml"

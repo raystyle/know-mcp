@@ -1,7 +1,7 @@
-target/
-*.log
-.rcd-index/
-knowledge/
-rcd-mcp.toml
-vendor/dlls/
-lints/target/
+/target
+/.know-index
+/vendor/dlls
+/vendor/zvec-lib
+/know-mcp.toml
+.env
+/models/

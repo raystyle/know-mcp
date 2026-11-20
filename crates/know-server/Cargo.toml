@@ -1,0 +1,46 @@
+[package]
+name = "know-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local daemon MCP server for hybrid search over archived code and documents"
+
+[[bin]]
+name = "know-mcp"
+path = "src/main.rs"
+
+[dependencies]
+know-core = { path = "../know-core" }
+rmcp = { version = "3.11", features = ["server", "transport-io", "transport-streamable-http-server"] }
+zvec-rust = "0.8.1"
+zvec-rust-build = "0.8.1"
+interprocess = { version = "2", features = ["tokio"] }
+futures-lite = "2"
+dunce = "1"
+wmi = "0.17"
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_Foundation", "Win32_System_Threading"] }
+chrono = { workspace = true }
+libc = "0.2"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "std", "fmt"] }
+
+[build-dependencies]
+zvec-rust-build = "0.8.1"
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+test-support = { path = "../test-support" }
+test-log = "0.2"
+tokio = { workspace = true }
+rmcp = { version = "3.11", features = ["client", "transport-child-process", "transport-io"] }
+serde_json = "1"
+tempfile = "3"

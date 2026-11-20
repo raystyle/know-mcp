@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 # Performance bench: index throughput, incremental overhead, query latency.
-# Requires: built binary + real GGUF model (rcd-mcp.toml) + zvec DLLs.
+# Requires: built binary + real GGUF model (know-mcp.toml) + zvec DLLs.
 # Usage: bash tests/bench.sh [--release] [N_FILES]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/env.sh
 
 case "${1:---debug}" in
-  --release) EXE=target/release/rcd-mcp ;;
-  *) EXE=target/debug/rcd-mcp ;;
+  --release) EXE=target/release/know-mcp ;;
+  *) EXE=target/debug/know-mcp ;;
 esac
 N_FILES="${2:-100}"
 [[ -f "$EXE" ]] || { echo "bench: $EXE not built" >&2; exit 1; }
 
-BENCH="$(cygpath -m "${TEMP:-/c/Windows/Temp}")/rcd-bench-$$"
+BENCH="$(cygpath -m "${TEMP:-/c/Windows/Temp}")/know-bench-$$"
 mkdir -p "$BENCH/corpus" "$BENCH/knowledge"
 trap 'rm -rf "$BENCH"; "$EXE" stop >/dev/null 2>&1 || true' EXIT
-export RCD_SOCKET_PATH="rcd-mcp-bench-$RANDOM"
+export KNOW_SOCKET_PATH="know-mcp-bench-$RANDOM"
 
-MODEL=$(python -c "import tomllib;print(tomllib.load(open('rcd-mcp.toml','rb'))['embed']['gguf_path'])")
+MODEL=$(python -c "import tomllib;print(tomllib.load(open('know-mcp.toml','rb'))['embed']['gguf_path'])")
 
 # --- Synthetic, reproducible corpus: N markdown+rust files with mixed
 # --- Chinese/English content and varied chunk counts.
@@ -39,7 +39,7 @@ for i in range(n):
 print(f"generated {n} files")
 PY
 
-cat > "$BENCH/rcd-mcp.toml" <<EOF
+cat > "$BENCH/know-mcp.toml" <<EOF
 [index]
 roots = ["$BENCH/corpus"]
 [notes]
@@ -51,7 +51,7 @@ tokenizer_repo = "Qwen/Qwen3-Embedding-0.6B"
 [storage]
 index_dir = "$BENCH/index"
 EOF
-CFG=(--config "$BENCH/rcd-mcp.toml")
+CFG=(--config "$BENCH/know-mcp.toml")
 
 ms() { # ms <n> — print elapsed ms of the last command via TIMEFORMAT
   :
@@ -73,7 +73,7 @@ T1=$(now_ms)
 echo "index.incremental: $((T1 - T0))ms"
 
 # --- 3. Query latency (10 samples each) --------------------------------
-"$EXE" "${CFG[@]}" status >/dev/null 2>&1   # daemon up (same RCD_SOCKET_PATH)
+"$EXE" "${CFG[@]}" status >/dev/null 2>&1   # daemon up (same KNOW_SOCKET_PATH)
 bench_query() { # bench_query <label> <mode> <query>
   local label=$1 mode=$2 query=$3
   local times=() t0 t1

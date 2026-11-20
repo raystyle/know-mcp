@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rcd-mcp-server build & lint workflow (three tiers).
+# know-mcp-server build & lint workflow (three tiers).
 #   rustc + clippy : cargo lint            (fast, everyday)
 set -e
 cd "$(dirname "$0")/.."
@@ -16,7 +16,7 @@ case "${1:-build}" in
     cargo clippy --all-targets -- -D warnings --no-deps
     ;;
   test)
-    cargo test -p rcd-core
+    cargo test -p know-core
     ;;
   *)
     echo "usage: build.sh [build|release|lint|test]" >&2
