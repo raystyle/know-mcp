@@ -143,7 +143,7 @@ pub async fn run_mcp_http(config: Option<PathBuf>) -> Result<()> {
 }
 
 /// Register this server with mcp2cli: named config + `know-cli` command alias.
-/// After this, `rcd search-content --query ...` works as a native CLI verb
+/// After this, `know search-content --query ...` works as a native CLI verb
 /// (mcp2cli turns our MCP tools into typed --flag commands).
 pub async fn run_mcp2cli(
     config_path: Option<PathBuf>,
@@ -187,7 +187,7 @@ pub async fn run_mcp2cli(
         anyhow::bail!("mcp2cli config init failed (exit {status})");
     }
 
-    // Activate and create the `rcd` command alias.
+    // Activate and create the `know` command alias.
     for args in [
         vec!["use", "know-cli"],
         vec!["link", "create", "--name", "know-cli"],

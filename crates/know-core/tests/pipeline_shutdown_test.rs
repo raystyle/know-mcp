@@ -31,7 +31,7 @@ fn fixture_config(tmp: &std::path::Path) -> Config {
         tmp.join("model.gguf").display().to_string().replace('\\', "/"),
         tmp.join("index").display().to_string().replace('\\', "/"),
     );
-    let path = tmp.join("rcd.toml");
+    let path = tmp.join("know-mcp.toml");
     std::fs::write(&path, raw).unwrap();
     Config::load(Some(&path)).expect("fixture config")
 }

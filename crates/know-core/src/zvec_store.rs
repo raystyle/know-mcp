@@ -14,7 +14,7 @@ use crate::store::{ChunkDoc, Hit, SearchOptions, SearchStore};
 
 /// Embedding dimension (Qwen3-Embedding-0.6B).
 const DIM: u32 = 1024;
-const COLLECTION_NAME: &str = "rcd";
+const COLLECTION_NAME: &str = "know";
 const OUTPUT_FIELDS: &[&str] = &[
     "kind",
     "path",

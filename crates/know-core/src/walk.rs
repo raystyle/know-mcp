@@ -51,7 +51,7 @@ pub fn collect_files(config: &Config) -> anyhow::Result<Vec<FoundFile>> {
                 let name = entry.file_name().to_string_lossy().to_lowercase();
                 if matches!(
                     name.as_str(),
-                    ".git" | "node_modules" | "target" | "vendor" | "dist" | "build" | ".rcd-index"
+                    ".git" | "node_modules" | "target" | "vendor" | "dist" | "build" | ".know-index"
                 ) {
                     return false;
                 }
