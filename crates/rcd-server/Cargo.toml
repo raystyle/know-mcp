@@ -18,7 +18,7 @@ interprocess = { version = "2", features = ["tokio"] }
 futures-lite = "2"
 dunce = "1"
 wmi = "0.17"
-windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader", "Win32_Foundation", "Win32_System_Threading"] }
 chrono = { workspace = true }
 libc = "0.2"
 axum = "0.8"

@@ -19,9 +19,12 @@ use rcd_core::store::{SearchMode, SearchStore};
 use rcd_core::sync::{self, IndexProgress};
 use rcd_core::zvec_store::ZvecStore;
 
-// Cold start loads the embedding model twice (~25-40s on GPU) before
-// binding the admin port — readiness polling must outlast that.
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+// Cold start loads the embedding model twice plus an initial index pass
+// before binding the admin port — readiness polling must outlast that.
+// 120s was too tight (observed 2026-11-20: model load + first index pass
+// exceeded it; the daemon eventually became ready but the client had
+// already given up).
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The daemon's loopback port file. A fresh daemon binds an ephemeral
@@ -246,22 +249,62 @@ pub async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
         progress: Arc::new(std::sync::Mutex::new(IndexProgress::default())),
     });
 
-    // Bind: first bind wins; AddrInUse = another daemon is already running.
-    // Single-instance mutex: a live daemon answers on the port file. Bind
-    // only when nobody answers; the port file write is atomic rename.
-    // Mutex scope = port dir: distinct RCD_PORT_DIR values are distinct
-    // daemons by design (test isolation) — the log lines below make any
-    // real-world double-daemon incident traceable from the log alone.
+    // Single-instance mutex: atomic lock-file create_new BEFORE the port
+    // dance. The old probe-then-bind had a race window the width of the
+    // double model load (~90s): two concurrent spawners both passed the
+    // probe, both bound (ephemeral ports never collide) and overwrote each
+    // other's port file (observed 2026-11-19: daemons on 60340 and 60505).
+    // OpenOptions::create_new is the only atomic mutual-exclusion primitive
+    // here (plain fs::write truncates an existing lock — it never fails);
+    // a stale lock is recovered by PID liveness. Mutex scope = port dir:
+    // distinct RCD_PORT_DIR values are distinct daemons by design (tests).
     let port_dir_display = port_dir().display().to_string();
     crate::logging::port_dir_selected(&port_dir_display);
-    if is_daemon_listening() {
-        let holder = std::fs::read_to_string(port_file())
-            .map(|s| format!("port {}", s.trim()))
-            .unwrap_or_else(|_| "unknown holder".into());
-        crate::logging::mutex_lost(&port_dir_display, &holder);
-        crate::logging::socket_bind_conflict("tcp-loopback");
-        anyhow::bail!("another daemon is already running");
+    let lock_path = port_dir().join("daemon.lock");
+    let lock_taken = (|| -> Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .context("opening daemon lock")?;
+        writeln!(file, "{}", std::process::id()).ok();
+        Ok(())
+    })();
+    if let Err(err) = lock_taken {
+        let already_exists = err
+            .downcast_ref::<std::io::Error>()
+            .map(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+            .unwrap_or(false);
+        if !already_exists {
+            return Err(err.into());
+        }
+        // Lock exists: live holder, or stale lock from a crashed daemon?
+        let holder_pid = std::fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+        let holder_alive = holder_pid.map(is_pid_alive).unwrap_or(false);
+        if holder_alive {
+            let holder = holder_pid
+                .map(|p| format!("pid {p}"))
+                .unwrap_or_else(|| "unknown holder".into());
+            crate::logging::mutex_lost(&port_dir_display, &holder);
+            crate::logging::socket_bind_conflict("tcp-loopback");
+            anyhow::bail!("another daemon is already running ({holder})");
+        }
+        // Holder is dead: take over the stale lock.
+        tracing::warn!(holder = ?holder_pid, "stale daemon lock — taking over");
+        let _ = std::fs::remove_file(&lock_path);
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .context("taking over stale daemon lock")?;
+        writeln!(file, "{}", std::process::id()).ok();
     }
+    // Lock held; the OS releases it when this process exits (delete on
+    // shutdown best-effort — a leftover is recovered by the PID check).
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let tmp = port_file().with_extension("tmp");
@@ -294,6 +337,40 @@ pub async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
 
 fn load_config(config_path: Option<PathBuf>) -> Result<Config> {
     Config::load(config_path.as_deref())
+}
+
+/// PID liveness probe for the daemon lock: true = a process with that PID
+/// is still RUNNING (not merely that the PID can be opened). On Windows an
+/// exited process stays "openable" while any handle survives (e.g. a
+/// parent's std::process::Child), so the naive OpenProcess probe reports
+/// zombies as alive — WaitForSingleObject(0) is the correct check: an
+/// exited process's handle is signaled even when other handles remain.
+#[cfg(windows)]
+fn is_pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    // SAFETY: open + zero-timeout wait + close on a numeric pid; no
+    // process state is touched.
+    #[allow(unsafe_code)]
+    let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if h.is_null() {
+        return pid == std::process::id(); // our own pid: alive by definition
+    }
+    // SAFETY: zero timeout — pure query, never blocks.
+    #[allow(unsafe_code)]
+    let rc = unsafe { WaitForSingleObject(h, 0) };
+    // SAFETY: closing the handle we just opened.
+    #[allow(unsafe_code)]
+    unsafe { CloseHandle(h) };
+    rc == WAIT_TIMEOUT // WAIT_OBJECT_0 (signaled) = process has exited
+}
+
+#[cfg(not(windows))]
+fn is_pid_alive(pid: u32) -> bool {
+    // kill(pid, 0): signal 0 is the documented existence probe.
+    // SAFETY: no signal is delivered; this only probes existence.
+    #[allow(unsafe_code)]
+    unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
 fn daemon_log_path(config: &Config) -> PathBuf {
@@ -351,6 +428,7 @@ fn handle_admin(request: Value, state: &Arc<DaemonState>) -> Option<String> {
             crate::logging::daemon_stopping();
             let _ = state.store.flush();
             let _ = std::fs::remove_file(port_file());
+            let _ = std::fs::remove_file(port_dir().join("daemon.lock"));
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 std::process::exit(0);

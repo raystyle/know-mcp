@@ -73,7 +73,7 @@ impl RcdMcpServer {
             "top_k": args.top_k.unwrap_or(10),
             "path_filter": args.path_filter,
         });
-        forward("search", params).await
+        forward(self.config_path.clone(), "search", params).await
     }
 
     /// Read a file under a configured root with line numbers.
@@ -135,7 +135,7 @@ impl RcdMcpServer {
     /// Daemon and index status.
     #[tool(description = "Index and daemon status: doc count, model, roots, indexing progress.")]
     async fn get_status(&self) -> Result<CallToolResult, McpError> {
-        forward("status", serde_json::json!({})).await
+        forward(self.config_path.clone(), "status", serde_json::json!({})).await
     }
 
     /// Trigger a background reindex.
@@ -144,19 +144,33 @@ impl RcdMcpServer {
         &self,
         Parameters(args): Parameters<ReindexArgs>,
     ) -> Result<CallToolResult, McpError> {
-        forward("reindex", serde_json::json!({"force": args.force.unwrap_or(false)})).await
+        forward(self.config_path.clone(), "reindex", serde_json::json!({"force": args.force.unwrap_or(false)})).await
     }
 
 
 }
 
 /// Forward a tool call to the daemon admin plane and wrap the reply.
-async fn forward(method: &str, params: serde_json::Value) -> Result<CallToolResult, McpError> {
+/// Cold-start tolerant: if no daemon is listening, spawn one and wait for
+/// readiness (model load + first index pass can take minutes — that's the
+/// daemon's READY_TIMEOUT, not ours; the tool call just takes that long
+/// once and is instant afterwards).
+async fn forward(
+    config_path: Option<std::path::PathBuf>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<CallToolResult, McpError> {
     let method = method.to_string();
-    let response = tokio::task::spawn_blocking(move || admin_request(&method, params))
-        .await
-        .map_err(|e| McpError::internal_error(format!("join: {e}"), None))?
-        .map_err(|e| McpError::internal_error(format!("daemon request failed: {e}"), None))?;
+    let response = tokio::task::spawn_blocking(move || {
+        // First call (or after a daemon death) pays the cold start; later
+        // calls find the daemon listening and skip straight to the request.
+        crate::daemon::ensure_daemon(config_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("daemon cold start failed: {e}"))?;
+        admin_request(&method, params)
+    })
+    .await
+    .map_err(|e| McpError::internal_error(format!("join: {e}"), None))?
+    .map_err(|e| McpError::internal_error(format!("daemon request failed: {e}"), None))?;
 
     if let Some(err) = response.get("error").and_then(|e| e.as_str()) {
         return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
