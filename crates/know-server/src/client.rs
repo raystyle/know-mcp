@@ -143,26 +143,26 @@ pub async fn run_mcp_http(config: Option<PathBuf>) -> Result<()> {
 }
 
 /// Native self-registration: copy this binary as `know-cli` into
-/// `install_dir` (default: next to the exe). The copy dispatches by exe
-/// name — same binary, verb-shaped CLI mirroring the MCP tools. No
-/// external dispatcher (this is what mcp2cli's Windows link create did
-/// for us; now in-tree). Re-run with --force after every upgrade.
+/// `install_dir` (default: next to the exe), along with the runtime DLLs
+/// sitting next to the exe (zvec, CUDA delay-load). The copy dispatches
+/// by exe name — same binary, verb-shaped CLI mirroring the MCP tools.
+/// No external dispatcher (this is what mcp2cli's Windows link create
+/// did for us; now in-tree). Re-run with --force after every upgrade.
 pub fn run_register(install_dir: Option<PathBuf>, force: bool) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current exe")?;
-    let dir = match install_dir {
-        Some(d) => d,
-        None => exe
-            .parent()
-            .context("exe has no parent directory")?
-            .to_path_buf(),
-    };
+    let exe_dir = exe
+        .parent()
+        .context("exe has no parent directory")?
+        .to_path_buf();
+    let dir = install_dir.unwrap_or_else(|| exe_dir.clone());
+    std::fs::create_dir_all(&dir).context("creating install dir")?;
     let cli_name = if cfg!(windows) {
         "know-cli.exe"
     } else {
         "know-cli"
     };
     let dest = dir.join(cli_name);
-    if dest.exists() && !force {
+    if dir != exe_dir && dest.exists() && !force {
         anyhow::bail!(
             "{} already exists — pass --force to overwrite (or re-register after upgrading know-mcp)",
             dest.display()
@@ -170,6 +170,18 @@ pub fn run_register(install_dir: Option<PathBuf>, force: bool) -> Result<()> {
     }
     std::fs::copy(&exe, &dest)
         .with_context(|| format!("copying {} -> {}", exe.display(), dest.display()))?;
+    // Runtime DLLs must travel with the copy: a know-cli spawned in an
+    // empty directory (or via WMI with System32 cwd) needs zvec/CUDA
+    // DLLs in its own exe directory or the daemon dies on store open
+    // while the caller polls for readiness (observed: 300s hang).
+    if dir != exe_dir {
+        for name in dll_siblings(&exe_dir) {
+            let from = exe_dir.join(&name);
+            let to = dir.join(&name);
+            std::fs::copy(&from, &to)
+                .with_context(|| format!("copying DLL {} -> {}", from.display(), to.display()))?;
+        }
+    }
     println!("registered: {}", dest.display());
     if !path_contains(&dir) {
         println!(
@@ -177,7 +189,6 @@ pub fn run_register(install_dir: Option<PathBuf>, force: bool) -> Result<()> {
             dir.display()
         );
     }
-    // Self-check: the copy must answer as know-cli.
     let status = std::process::Command::new(&dest)
         .arg("--help")
         .stdout(std::process::Stdio::null())
@@ -193,6 +204,22 @@ pub fn run_register(install_dir: Option<PathBuf>, force: bool) -> Result<()> {
     println!("try: know-cli get-status");
     println!("     know-cli search-content --query \"混合检索\" --mode hybrid");
     Ok(())
+}
+
+/// DLLs that must ship with a copied binary (loaded at store open:
+/// zvec engine + CUDA runtime the delay-loader resolves).
+fn dll_siblings(exe_dir: &std::path::Path) -> Vec<String> {
+    let wanted = [
+        "zvec_c_api.dll",
+        "cudart64_13.dll",
+        "cublas64_13.dll",
+        "cublasLt64_13.dll",
+    ];
+    wanted
+        .iter()
+        .filter(|name| exe_dir.join(name).is_file())
+        .map(|name| name.to_string())
+        .collect()
 }
 
 fn path_contains(dir: &std::path::Path) -> bool {

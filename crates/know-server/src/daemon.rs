@@ -268,7 +268,13 @@ pub async fn run_daemon(config_path: Option<PathBuf>) -> Result<()> {
     // distinct KNOW_PORT_DIR values are distinct daemons by design (tests).
     let port_dir_display = port_dir().display().to_string();
     crate::logging::port_dir_selected(&port_dir_display);
-    let lock_path = port_dir().join("daemon.lock");
+    let lock_dir = port_dir();
+    // The lock is the FIRST artifact written into the port dir — WMI-
+    // spawned daemons arrive with a port-dir flag whose directory may
+    // not exist yet (create_new does not create parents; the daemon
+    // would exit instantly and the spawner would poll for 300s).
+    std::fs::create_dir_all(&lock_dir)?;
+    let lock_path = lock_dir.join("daemon.lock");
     let lock_taken = (|| -> Result<()> {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()

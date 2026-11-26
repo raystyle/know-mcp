@@ -37,6 +37,8 @@ hf-hub = { version = "0.4", default-features = false, features = ["tokio", "ureq
 [dev-dependencies]
 test-support = { path = "../test-support" }
 tempfile = "3"
+# reader_test builds a minimal OOXML docx in-test to guard the anydoc path.
+zip = "8.6"
 
 [lints]
 workspace = true
