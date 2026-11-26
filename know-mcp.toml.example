@@ -9,7 +9,7 @@ roots = [
 ]
 exclude = []                   # extra exclude globs on top of the defaults
 max_file_bytes = 10_000_000
-extensions = []                # empty = built-in whitelist (rs/ts/js/py/go/md/txt/...)
+extensions = []                # empty = built-in whitelist (rs/ts/js/py/go/md/txt/... plus pdf/docx/epub/... and images when [reader] is on)
 
 [chunk]
 chars = 1000
@@ -28,6 +28,16 @@ default_top_k = 10
 
 [server]
 http_bind = "127.0.0.1:8765"
+
+[reader]
+# Document extraction (reader_rs heritage, all in-tree): pdf-inspector
+# layout pipeline for PDF, anydoc engine for the office family
+# (docx/epub/odt/rtf/ppt/xls/csv), ppocr-rs PP-OCRv6 OCR fallback for
+# textless pages and images. Model cache is know-mcp's own
+# (KNOW_OCR_CACHE_DIR or %LOCALAPPDATA%/know-mcp/ocr-models).
+enabled = true
+ocr = true                       # OCR textless PDF pages (slow pages, first use downloads ~6MB models)
+images = true                    # index image files via OCR (requires ocr = true)
 
 [storage]
 index_dir = "D:/archives/.know-index"

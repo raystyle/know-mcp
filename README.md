@@ -2,7 +2,7 @@
 
 > 本地**代码搜索 + 文档搜索** MCP server：对归档的代码仓库和文档做关键字 + 向量语义混合检索，带行号读取，本地推理零外发。
 
-一次构建，**MCP** 三种消费形态：**MCP STDIO**（`know-mcp stdio`，Claude Code 等本地客户端）、**MCP HTTP**（`know-mcp http`，多客户端网络共享）、**MCP2CLI**（`know-mcp register` 一键注册，MCP 工具转译为原生命令 `know-cli`）。
+一次构建，**MCP** 三种消费形态：**MCP STDIO**（`know-mcp stdio`，Claude Code 等本地客户端）、**MCP HTTP**（`know-mcp http`，多客户端网络共享）、**CLI 动词**（`know-mcp register` 原生注册 `know-cli`，MCP 工具一对一映射为命令行动词）。
 
 ## 功能
 
@@ -13,6 +13,7 @@
 - **三段流水线索引**：N 生产者线程（读+分块）→ GPU 嵌入（llama.cpp，CUDA）→ 有序入库；14k 文件全量 ~107 分钟（RTX 4060），增量重扫 11 秒
 - **GPU 自适应**：检测到 CUDA 设备自动全层卸载，无 GPU 纯 CPU 亦可用，零配置
 - **文本安全**：扩展名白名单 + NUL 嗅探 + UTF-8 校验三层过滤，二进制内容不入库
+- **文档格式检索**（reader_rs 血统，全原生内建）：PDF（pdf-inspector 布局管线）与 Word/EPUB/Office/CSV 家族（anydoc 引擎）抽取文本层入索引；扫描页与图片走 PP-OCRv6 OCR 兜底（ppocr-rs 原生内核）；OCR 模型缓存 know-mcp 自持（`KNOW_OCR_CACHE_DIR` 或 `%LOCALAPPDATA%/know-mcp/ocr-models`，首用自动下载）
 
 ## 架构
 
@@ -20,15 +21,16 @@
 ┌─ MCP 客户端
 │  形态一 STDIO:  know-mcp stdio      (Claude Code 等本地客户端)
 │  形态二 HTTP:   know-mcp http       (→ /mcp, 多客户端共享)
-│  形态三 CLI:    know-mcp register   (mcp2cli 转译为 know-cli <verb>)
+│  形态三 CLI:    know-mcp register   (原生注册 know-cli <verb>)
 ▼
 ┌─ daemon (know-mcp daemon, 后台常驻, 单实例, 启动秒级)
 │  ├─ JSON 管理面 (TCP loopback + admin.port 文件)
 │  ├─ zvec collection (HNSW INT8 向量 + jieba FTS + 引擎级 RRF 混合)
 │  ├─ Qwen3-Embedding-0.6B (懒加载: 索引/查询各自首次使用时加载, llama.cpp, GPU 自适应)
+│  ├─ 文档抽取 (PDF: pdf-inspector 布局管线; Word/EPUB/Office: anydoc; OCR 兜底: ppocr-rs PP-OCRv6)
 │  ├─ 索引任务 (显式触发: build_index / manage_index add_root; 三段流水线 producer×N → GPU embed → store)
 │  └─ 索引锁 (daemon.lock 原子互斥 + PID 存活检测接管)
-└─ CLI: status / stop / index / search (都走 daemon)
+└─ CLI: status / stop / index / search / read (都走 daemon)
 ```
 
 ## MCP 工具（5 个）
@@ -36,7 +38,7 @@
 | 工具 | 说明 |
 |---|---|
 | `search_content` | 混合检索；mode: auto/keyword/vector/hybrid；path_filter 范围过滤 |
-| `read_file` | 带行号读取（roots 白名单校验，2000 行/256KB 上限） |
+| `read_file` | 带行号读取（roots 白名单校验，2000 行/256KB 上限；PDF/Word/EPUB/Office 走文本抽取管线，扫描页 OCR 兜底） |
 | `get_status` | 索引/进度状态 |
 | `build_index` | 触发增量重索引（force=true 全量重嵌入） |
 | `manage_index` | 索引管理：查/加/删索引目录、清空索引（详见下表） |
@@ -136,18 +138,21 @@ claude mcp add know-search -- <repo>/target/release/know-mcp stdio
 know-mcp http    # http://127.0.0.1:8765/mcp（挂 daemon）
 ```
 
-### 形态三：MCP2CLI（注册为原生命令）
+### 形态三：CLI 动词（原生注册 know-cli）
 
 ```bash
-# 前置：安装 mcp2cli（一次性）
-cargo install --git https://github.com/mcp2cli/source-code
+know-mcp register        # 复制自身为 know-cli.exe（默认放 exe 同目录；--install-dir 指定；升级后 --force 重注册）
 
-know-mcp register        # stdio 桥（自动拉起 daemon）；--transport http 走 HTTP
-
-# 之后即得 know-cli：
+# 之后即得 know-cli（MCP 工具一对一动词，支持 --json 信封输出）：
 know-cli get-status
-know-cli search-content --query "混合检索" --mode hybrid
+know-cli search-content "混合检索" --mode hybrid --top-k 5
+know-cli search-content "quantization" --mode keyword --json | jq '.data.hits[0].path'
+know-cli read-file <path> --start-line 10
+know-cli build-index --force
+know-cli manage-index list_roots
 ```
+
+零外部依赖：register 是原生子复制（同 mcp2cli 在 Windows 的 link 机制，但内化了）；动词直连 daemon 管理面，不经 MCP 协议层。
 
 ### CLI 速查
 

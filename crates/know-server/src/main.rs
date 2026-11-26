@@ -76,19 +76,106 @@ enum Command {
         #[command(subcommand)]
         action: ManageAction,
     },
-    /// Register this server as a native CLI: `know-cli` (via mcp2cli binding).
+    /// Register `know-cli`: copy this binary under the CLI name (native
+    /// self-registration, no external dispatcher). Re-run with --force
+    /// after every know-mcp upgrade.
     #[command(name = "register")]
-    Mcp2Cli {
-        /// Transport for the binding: stdio bridge (default) or http.
-        #[arg(long, default_value = "stdio")]
-        transport: String,
-        /// HTTP endpoint when --transport http (default from config).
+    Register {
+        /// Directory to place know-cli in (default: next to this exe).
         #[arg(long)]
-        endpoint: Option<String>,
-        /// Overwrite an existing named config.
+        install_dir: Option<std::path::PathBuf>,
+        /// Overwrite an existing know-cli copy.
         #[arg(long)]
         force: bool,
     },
+}
+
+/// Verb CLI invoked via the `know-cli` binary name: the register command
+/// copies this binary under that name, and the exe stem is the dispatch
+/// key. Verbs mirror the MCP tools 1:1 over the daemon admin plane.
+#[derive(clap::Parser)]
+pub struct KnowCliArgs {
+    /// Path to know-mcp.toml (default: KNOW_MCP_CONFIG env or exe-adjacent).
+    #[arg(long, global = true)]
+    config: Option<std::path::PathBuf>,
+
+    /// Admin port-file directory (default: KNOW_PORT_DIR or %APPDATA%/know-mcp).
+    #[arg(long, global = true)]
+    port_dir: Option<std::path::PathBuf>,
+
+    /// Log level override (default: RUST_LOG).
+    #[arg(long, global = true)]
+    log_level: Option<String>,
+
+    /// Machine-readable envelope: {"app":"know-cli","verb":...,"data":...}.
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: KnowCliVerb,
+}
+
+#[derive(clap::Subcommand)]
+pub enum KnowCliVerb {
+    /// Index and daemon status (the get_status MCP tool).
+    GetStatus,
+    /// Hybrid search over indexed code and docs (the search_content MCP tool).
+    SearchContent {
+        query: String,
+        /// auto (default) | keyword | vector | hybrid.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Max hits (default 10).
+        #[arg(long)]
+        top_k: Option<usize>,
+        /// Case-insensitive substring filter on file paths.
+        #[arg(long)]
+        path_filter: Option<String>,
+    },
+    /// Read a file with line numbers (the read_file MCP tool; operator
+    /// scope: no roots check, unlike the MCP surface).
+    ReadFile {
+        #[arg(long)]
+        path: String,
+        /// 1-based first line (default 1).
+        #[arg(long)]
+        start_line: Option<u64>,
+        /// 1-based last line (default start+2000, cap 2000 lines / 256KB).
+        #[arg(long)]
+        end_line: Option<u64>,
+    },
+    /// Start a background reindex (the build_index MCP tool).
+    BuildIndex {
+        /// Re-embed every file regardless of sync state.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Index management (the manage_index MCP tool).
+    ManageIndex {
+        /// One of: list_roots, add_root, remove_root, drop.
+        action: String,
+        /// Directory path (add_root / remove_root); must sit inside the
+        /// configured allowed_roots boundary.
+        #[arg(long)]
+        path: Option<String>,
+        /// drop requires --confirm.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Internal: daemon runtime (ensure_daemon spawns `<exe> daemon`).
+    #[command(hide = true)]
+    Daemon,
+}
+
+/// True when this process was launched through the `know-cli` copy (the
+/// exe file stem is the dispatch key, the same routing mcp2cli uses for
+/// its copied aliases on Windows).
+fn know_cli_invoked() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .as_deref()
+        == Some("know-cli")
 }
 
 #[derive(Subcommand)]
@@ -111,6 +198,17 @@ enum ManageAction {
 async fn main() -> Result<()> {
     load_dotenv();
     configure_lib_search_path();
+
+    if know_cli_invoked() {
+        let args: KnowCliArgs = clap::Parser::parse();
+        if let Some(dir) = args.port_dir.clone() {
+            std::env::set_var("KNOW_PORT_DIR", dir);
+        }
+        if let Some(level) = args.log_level.clone() {
+            std::env::set_var("RUST_LOG", level);
+        }
+        return client::run_cli_verb(args.config, args.json, args.command).await;
+    }
 
     let cli = Cli::parse();
     // Flags beat env (the WMI spawn path passes them explicitly because
@@ -140,11 +238,7 @@ async fn main() -> Result<()> {
             end_line,
         } => client::run_read(cli.config, path, start_line, end_line).await,
         Command::Manage { action } => client::run_manage(cli.config, action).await,
-        Command::Mcp2Cli {
-            transport,
-            endpoint,
-            force,
-        } => client::run_mcp2cli(cli.config, transport, endpoint, force).await,
+        Command::Register { install_dir, force } => client::run_register(install_dir, force),
     }
 }
 

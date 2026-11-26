@@ -92,7 +92,7 @@ impl KnowMcpServer {
 
     /// Read a file under a configured root with line numbers.
     #[tool(
-        description = "Read a file from the archive with 1-based line numbers. Optional start_line/end_line; caps at 2000 lines or 256KB. Paths outside the configured roots are rejected."
+        description = "Read a file from the archive with 1-based line numbers. Optional start_line/end_line; caps at 2000 lines or 256KB. Paths outside the configured roots are rejected. Document formats (PDF/Word/EPUB/Office) are read through the text-extraction pipeline (OCR fallback for scanned pages)."
     )]
     async fn read_file(
         &self,
@@ -118,9 +118,22 @@ impl KnowMcpServer {
             ));
         }
 
-        let content = std::fs::read_to_string(&canonical).map_err(|e| {
-            McpError::invalid_params(format!("reading {}: {e}", canonical.display()), None)
-        })?;
+        // Document formats (pdf/docx/epub/…) read through the extraction
+        // pipeline (text layer, OCR fallback per config), not raw bytes.
+        let is_doc = canonical
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| know_core::reader::is_reader_format(&e.to_lowercase()))
+            .unwrap_or(false);
+        let content = if is_doc {
+            know_core::reader::extract_text(&canonical, config.reader.ocr).map_err(|e| {
+                McpError::internal_error(format!("extracting {}: {e}", canonical.display()), None)
+            })?
+        } else {
+            std::fs::read_to_string(&canonical).map_err(|e| {
+                McpError::invalid_params(format!("reading {}: {e}", canonical.display()), None)
+            })?
+        };
         let start = args.start_line.unwrap_or(1).max(1);
         let end = args
             .end_line

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -215,6 +215,7 @@ pub fn run_incremental_index(
     progress: Option<&(dyn Fn(IndexProgress) + Send + Sync)>,
 ) -> Result<IndexOutcome> {
     let index_dir = &config.storage.index_dir;
+    let reader_cfg = &config.reader;
     let mut state = SyncState::load(&sync_state_path(index_dir))?;
     let files = collect_files(config)?;
     // Token-budget chunking (CJK-adaptive). Legacy char config maps to a
@@ -455,7 +456,9 @@ pub fn run_incremental_index(
                         }
                         let found = &files[i];
                         counters.scanned.fetch_add(1, Ordering::Relaxed);
-                        if let Err(err) = produce_one(found, state, force, chunk_params, &tx) {
+                        if let Err(err) =
+                            produce_one(found, state, force, chunk_params, reader_cfg, &tx)
+                        {
                             tracing::warn!(path = %found.path.display(), error = %err, "produce failed");
                             counters.failed.fetch_add(1, Ordering::Relaxed);
                         }
@@ -533,6 +536,7 @@ fn produce_one(
     state: &SyncState,
     force: bool,
     chunk_params: &ChunkParams,
+    reader_cfg: &crate::config::ReaderConfig,
     tx: &SyncSender<Produce>,
 ) -> Result<()> {
     let canonical = dunce::canonicalize(&found.path).unwrap_or_else(|_| found.path.clone());
@@ -572,20 +576,34 @@ fn produce_one(
     let Ok(raw) = std::fs::read(&found.path) else {
         anyhow::bail!("read failed");
     };
-    // Text detection, layer 3: NUL sniff in the first 8KB — binary files
-    // with whitelisted extensions are skipped, not failures.
-    let head = &raw[..raw.len().min(8192)];
-    if head.contains(&0u8) {
-        return Ok(());
-    }
-    let raw = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        &raw[3..]
+    let ext_lower = ext_of(&found.path);
+    // Reader pipeline: document formats (pdf/docx/epub/… and, with OCR,
+    // images) extract their text layer natively (anydoc / pdf-inspector
+    // / ppocr-rs, reader_rs heritage) instead of the UTF-8 reader.
+    // These are binary containers — the NUL sniff below would always
+    // skip them.
+    let via_reader = reader_cfg.enabled
+        && (crate::reader::is_reader_format(&ext_lower)
+            || (reader_cfg.images && reader_cfg.ocr && crate::reader::is_image_format(&ext_lower)));
+    let text = if via_reader {
+        crate::reader::extract_text(&found.path, reader_cfg.ocr)
+            .with_context(|| format!("extracting {}", found.path.display()))?
     } else {
-        &raw[..]
-    };
-    let text = match String::from_utf8(raw.to_vec()) {
-        Ok(t) => t,
-        Err(_) => return Ok(()),
+        // Text detection, layer 3: NUL sniff in the first 8KB — binary files
+        // with whitelisted extensions are skipped, not failures.
+        let head = &raw[..raw.len().min(8192)];
+        if head.contains(&0u8) {
+            return Ok(());
+        }
+        let raw = if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+            &raw[3..]
+        } else {
+            &raw[..]
+        };
+        match String::from_utf8(raw.to_vec()) {
+            Ok(t) => t,
+            Err(_) => return Ok(()),
+        }
     };
     let content_hash = {
         let mut h = Sha256::new();
@@ -609,11 +627,7 @@ fn produce_one(
         }
     }
 
-    let ext = found
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = ext_lower.as_str();
     let mut chunks = chunk_text_code(&text, ext, chunk_params);
     // Context prepend: markdown gets the heading breadcrumb, code gets
     // file path + language.
@@ -640,12 +654,7 @@ fn produce_one(
 
     let loc = locator_of(canon_str);
     let title = title_of(&text, &found.path);
-    let lang = found
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let lang = ext_lower.clone();
     let rel_path = canonical
         .strip_prefix(&found.root)
         .map(|p| p.to_string_lossy().to_string())

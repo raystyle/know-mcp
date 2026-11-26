@@ -142,74 +142,70 @@ pub async fn run_mcp_http(config: Option<PathBuf>) -> Result<()> {
     crate::http::serve(config).await
 }
 
-/// Register this server with mcp2cli: named config + `know-cli` command alias.
-/// After this, `know search-content --query ...` works as a native CLI verb
-/// (mcp2cli turns our MCP tools into typed --flag commands).
-pub async fn run_mcp2cli(
-    config_path: Option<PathBuf>,
-    transport: String,
-    endpoint: Option<String>,
-    force: bool,
-) -> Result<()> {
-    let mcp2cli = which_mcp2cli()
-        .ok_or_else(|| anyhow::anyhow!(
-            "mcp2cli not found on PATH — install it first: cargo install --git https://github.com/mcp2cli/source-code"
-        ))?;
-    let exe = std::env::current_exe()?;
-
-    let mut cmd = std::process::Command::new(&mcp2cli);
-    cmd.args(["config", "init", "--name", "know-cli", "--app", "bridge"]);
-    match transport.as_str() {
-        "stdio" => {
-            // The bridge auto-spawns our daemon; stdio keeps it local-only.
-            cmd.args(["--transport", "stdio"]);
-            let exe_str = exe.to_string_lossy();
-            cmd.args(["--stdio-command", exe_str.as_ref()]);
-            cmd.args(["--stdio-arg", "mcp"]);
-        }
-        "http" => {
-            let url = endpoint.unwrap_or_else(|| {
-                let bind = know_core::config::Config::load(config_path.as_deref())
-                    .map(|c| c.server.http_bind.clone())
-                    .unwrap_or_else(|_| "127.0.0.1:8765".to_string());
-                format!("http://{bind}/mcp")
-            });
-            cmd.args(["--transport", "streamable_http"]);
-            cmd.args(["--endpoint", &url]);
-        }
-        other => anyhow::bail!("unknown transport {other:?} (use stdio or http)"),
+/// Native self-registration: copy this binary as `know-cli` into
+/// `install_dir` (default: next to the exe). The copy dispatches by exe
+/// name — same binary, verb-shaped CLI mirroring the MCP tools. No
+/// external dispatcher (this is what mcp2cli's Windows link create did
+/// for us; now in-tree). Re-run with --force after every upgrade.
+pub fn run_register(install_dir: Option<PathBuf>, force: bool) -> Result<()> {
+    let exe = std::env::current_exe().context("resolving current exe")?;
+    let dir = match install_dir {
+        Some(d) => d,
+        None => exe
+            .parent()
+            .context("exe has no parent directory")?
+            .to_path_buf(),
+    };
+    let cli_name = if cfg!(windows) {
+        "know-cli.exe"
+    } else {
+        "know-cli"
+    };
+    let dest = dir.join(cli_name);
+    if dest.exists() && !force {
+        anyhow::bail!(
+            "{} already exists — pass --force to overwrite (or re-register after upgrading know-mcp)",
+            dest.display()
+        );
     }
-    if force {
-        cmd.arg("--force");
+    std::fs::copy(&exe, &dest)
+        .with_context(|| format!("copying {} -> {}", exe.display(), dest.display()))?;
+    println!("registered: {}", dest.display());
+    if !path_contains(&dir) {
+        println!(
+            "note: {} is not on PATH — add it to use `know-cli` from anywhere",
+            dir.display()
+        );
     }
-    let status = cmd.status().context("running mcp2cli config init")?;
-    if !status.success() {
-        anyhow::bail!("mcp2cli config init failed (exit {status})");
-    }
-
-    // Activate and create the `know` command alias.
-    for args in [
-        vec!["use", "know-cli"],
-        vec!["link", "create", "--name", "know-cli"],
-    ] {
-        let status = std::process::Command::new(&mcp2cli)
-            .args(&args)
-            .status()
-            .with_context(|| format!("running mcp2cli {}", args.join(" ")))?;
-        if !status.success() {
-            anyhow::bail!("mcp2cli {} failed (exit {status})", args.join(" "));
+    // Self-check: the copy must answer as know-cli.
+    let status = std::process::Command::new(&dest)
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match status {
+        Ok(s) if s.success() => println!("self-check ok: know-cli --help"),
+        other => {
+            let _ = std::fs::remove_file(&dest);
+            anyhow::bail!("know-cli copy failed self-check: {other:?} — removed");
         }
     }
-
-    println!("registered: mcp2cli config `know-cli` + `know-cli` command");
-    println!("try: know-cli get-status          # daemon/index status");
+    println!("try: know-cli get-status");
     println!("     know-cli search-content --query \"混合检索\" --mode hybrid");
     Ok(())
+}
+
+fn path_contains(dir: &std::path::Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p == dir))
+        .unwrap_or(false)
 }
 
 /// CLI read: no roots allowlist check (unlike the MCP tool) — the CLI
 /// runs as the local user with the user's own filesystem rights; the
 /// MCP guard exists for untrusted client input, not for the operator.
+/// Document formats (pdf/docx/…) read through the extraction pipeline
+/// (text layer, OCR fallback), not raw bytes.
 pub async fn run_read(
     config: Option<PathBuf>,
     path: String,
@@ -217,10 +213,21 @@ pub async fn run_read(
     end_line: Option<u64>,
 ) -> Result<()> {
     ensure_daemon(config.as_deref())?;
-    let canonical = dunce::canonicalize(&path)
-        .with_context(|| format!("cannot resolve path {path}"))?;
-    let content = std::fs::read_to_string(&canonical)
-        .with_context(|| format!("reading {}", canonical.display()))?;
+    let canonical =
+        dunce::canonicalize(&path).with_context(|| format!("cannot resolve path {path}"))?;
+    let is_doc = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| know_core::reader::is_reader_format(&e.to_lowercase()))
+        .unwrap_or(false);
+    let content = if is_doc {
+        let cfg = know_core::config::Config::load(config.as_deref())?;
+        know_core::reader::extract_text(&canonical, cfg.reader.ocr)
+            .with_context(|| format!("extracting {}", canonical.display()))?
+    } else {
+        std::fs::read_to_string(&canonical)
+            .with_context(|| format!("reading {}", canonical.display()))?
+    };
     let start = start_line.unwrap_or(1).max(1);
     let end = end_line.unwrap_or(start + 2000 - 1).min(start + 2000 - 1);
     let mut taken: usize = 0;
@@ -246,9 +253,7 @@ pub async fn run_read(
 pub async fn run_manage(config: Option<PathBuf>, action: crate::ManageAction) -> Result<()> {
     ensure_daemon(config.as_deref())?;
     let (method_params, payload_key) = match action {
-        crate::ManageAction::ListRoots => {
-            (json!({"action": "list_roots"}), "roots")
-        }
+        crate::ManageAction::ListRoots => (json!({"action": "list_roots"}), "roots"),
         crate::ManageAction::AddRoot { path } => {
             (json!({"action": "add_root", "path": path}), "added")
         }
@@ -271,7 +276,11 @@ pub async fn run_manage(config: Option<PathBuf>, action: crate::ManageAction) ->
                 println!("  {}", r.as_str().unwrap_or("?"));
             }
             println!("allowed_roots (authorization boundary):");
-            for r in result["allowed_roots"].as_array().cloned().unwrap_or_default() {
+            for r in result["allowed_roots"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
                 println!("  {}", r.as_str().unwrap_or("?"));
             }
         }
@@ -280,14 +289,102 @@ pub async fn run_manage(config: Option<PathBuf>, action: crate::ManageAction) ->
     Ok(())
 }
 
-fn which_mcp2cli() -> Option<PathBuf> {
-    let name = if cfg!(windows) {
-        "mcp2cli.exe"
-    } else {
-        "mcp2cli"
+/// know-cli verb runner: dispatch the tool-shaped subcommands over the
+/// daemon admin plane. `json` wraps results in the CLI envelope.
+pub async fn run_cli_verb(
+    config_path: Option<PathBuf>,
+    json: bool,
+    verb: crate::KnowCliVerb,
+) -> Result<()> {
+    use crate::KnowCliVerb;
+    type Renderer = Box<dyn FnOnce(&Value) -> String>;
+    let (method, params, render): (&str, Value, Renderer) = match verb {
+        KnowCliVerb::GetStatus => (
+            "status",
+            json!({}),
+            Box::new(|r| serde_json::to_string_pretty(r).unwrap_or_default()),
+        ),
+        KnowCliVerb::SearchContent {
+            query,
+            mode,
+            top_k,
+            path_filter,
+        } => (
+            "search",
+            json!({
+                "query": query,
+                "mode": mode.as_deref().unwrap_or("auto"),
+                "top_k": top_k.unwrap_or(10),
+                "path_filter": path_filter,
+            }),
+            Box::new(|r| {
+                let hits = r["hits"].as_array().cloned().unwrap_or_default();
+                let mut out = format!("mode: {}\n", r["mode"].as_str().unwrap_or("?"));
+                if hits.is_empty() {
+                    out.push_str("no hits\n");
+                }
+                for hit in hits {
+                    out.push_str(&format!(
+                        "[{}] {:.3} {}:{}-{} {}\n",
+                        hit["kind"].as_str().unwrap_or("?"),
+                        hit["score"].as_f64().unwrap_or(0.0),
+                        hit["path"].as_str().unwrap_or("?"),
+                        hit["start_line"].as_u64().unwrap_or(0),
+                        hit["end_line"].as_u64().unwrap_or(0),
+                        hit["title"].as_str().unwrap_or(""),
+                    ));
+                }
+                out
+            }),
+        ),
+        KnowCliVerb::BuildIndex { force } => (
+            "reindex",
+            json!({"force": force}),
+            Box::new(|r| r.as_str().unwrap_or("started").to_string()),
+        ),
+        KnowCliVerb::ManageIndex {
+            action,
+            path,
+            confirm,
+        } => {
+            let mut params = json!({"action": action});
+            if let Some(p) = path {
+                params["path"] = json!(p);
+            }
+            params["confirm"] = json!(confirm);
+            (
+                "manage_index",
+                params,
+                Box::new(|r| serde_json::to_string_pretty(r).unwrap_or_default()),
+            )
+        }
+        KnowCliVerb::Daemon => return crate::daemon::run_daemon(config_path).await,
+        KnowCliVerb::ReadFile {
+            path,
+            start_line,
+            end_line,
+        } => {
+            // Direct read (no daemon needed); document formats go through
+            // the reader pipeline.
+            return run_read(config_path, path, start_line, end_line).await;
+        }
     };
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+
+    ensure_daemon(config_path.as_deref())?;
+    let response = admin_request(method, params)?;
+    if let Some(err) = response.get("error").and_then(|e| e.as_str()) {
+        anyhow::bail!("{err}");
+    }
+    let result = response["result"].clone();
+    if json {
+        let envelope = json!({
+            "app": "know-cli",
+            "verb": method,
+            "data": result,
+        });
+        println!("{}", serde_json::to_string(&envelope)?);
+    } else {
+        print!("{}", render(&result));
+    }
+    Ok(())
 }

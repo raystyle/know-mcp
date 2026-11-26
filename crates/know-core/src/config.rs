@@ -8,11 +8,25 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-/// File extensions indexed when `[index].extensions` is empty.
+/// Text/code extensions indexed when `[index].extensions` is empty.
+/// Document formats (pdf/docx/epub/…) and images are appended by
+/// [`Config::extensions`] when the reader pipeline is enabled.
 pub const DEFAULT_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "mjs", "cjs", "py", "go", "c", "h", "cpp", "hpp", "java", "rb", "php",
     "lua", "sh", "ps1", "toml", "yaml", "yml", "json", "md", "txt",
 ];
+
+/// Document formats extracted via the reader pipeline (reader_rs): the
+/// extension whitelist gains these when `[reader].enabled`.
+pub const READER_DOC_EXTENSIONS: &[&str] = &[
+    "pdf", "doc", "docx", "docm", "epub", "odt", "rtf", "ppt", "pptx", "xls", "xlsx", "xlsm",
+    "xlsb", "ods", "odp", "csv",
+];
+
+/// Image formats: indexed only when `[reader].ocr` and `[reader].images`
+/// are both on (they carry no text layer without OCR).
+pub const READER_IMAGE_EXTENSIONS: &[&str] =
+    &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "tif"];
 
 /// Directories always excluded, on top of gitignore rules.
 /// `claude-src` has no `.git`, so node_modules must be excluded explicitly.
@@ -50,6 +64,7 @@ pub struct Config {
     pub search: SearchConfig,
     pub server: ServerConfig,
     pub storage: StorageConfig,
+    pub reader: ReaderConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -176,6 +191,33 @@ impl Default for StorageConfig {
     }
 }
 
+/// Document extraction backend (reader_rs). `reader` reads PDF/Word/EPUB/
+/// Office text layers and OCRs scanned pages; know-mcp shells out to it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReaderConfig {
+    /// The reader binary name/path on this machine (`reader` or `rr`).
+    pub command: String,
+    /// Index document formats (pdf/docx/epub/...) via the reader pipeline.
+    pub enabled: bool,
+    /// OCR fallback for needs_ocr pages and images (PP-OCRv6; first use
+    /// downloads ~6MB of models into reader's cache).
+    pub ocr: bool,
+    /// Index image files (each OCRs as one unit; requires ocr = true).
+    pub images: bool,
+}
+
+impl Default for ReaderConfig {
+    fn default() -> Self {
+        Self {
+            command: "reader".to_string(),
+            enabled: true,
+            ocr: true,
+            images: true,
+        }
+    }
+}
+
 impl Config {
     pub fn load(explicit: Option<&Path>) -> Result<Self> {
         let path = explicit
@@ -212,9 +254,11 @@ impl Config {
         Ok(())
     }
 
-    /// Effective extension whitelist (lowercased, without leading dot).
+    /// Effective extension whitelist (lowercased, without leading dot):
+    /// the text/code base plus reader document formats when the reader
+    /// pipeline is on, and images only when OCR can give them a text layer.
     pub fn extensions(&self) -> Vec<String> {
-        if self.index.extensions.is_empty() {
+        let mut base: Vec<String> = if self.index.extensions.is_empty() {
             DEFAULT_EXTENSIONS.iter().map(|s| s.to_string()).collect()
         } else {
             self.index
@@ -222,7 +266,14 @@ impl Config {
                 .iter()
                 .map(|s| s.trim_start_matches('.').to_lowercase())
                 .collect()
+        };
+        if self.reader.enabled {
+            base.extend(READER_DOC_EXTENSIONS.iter().map(|s| s.to_string()));
+            if self.reader.ocr && self.reader.images {
+                base.extend(READER_IMAGE_EXTENSIONS.iter().map(|s| s.to_string()));
+            }
         }
+        base
     }
 
     /// All exclude globs: defaults + config extras.

@@ -11,6 +11,8 @@ pub mod ast_chunker;
 pub mod chunker;
 pub mod config;
 pub mod embed;
+pub mod ocr;
+pub mod reader;
 pub mod search;
 pub mod store;
 pub mod sync;

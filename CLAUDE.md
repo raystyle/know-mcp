@@ -9,10 +9,12 @@ walk → read → chunk → embed → store(zvec) → search(hybrid)
 ```
 
 - **分块**：`chunker.rs`（token 预算自适应 CJK）+ `ast_chunker.rs`（代码 AST 边界）；markdown 加 heading breadcrumb 上下文，代码加 `rel_path [lang]` 上下文（`sync.rs` 里 contextualize）
+- **文档抽取**：`reader.rs` + `ocr.rs`（reader_rs 血统，全原生）— PDF 走 pdf-inspector 布局管线（页级、needs_ocr 检出），Word/EPUB/Office/CSV 家族走 anydoc 引擎（GFM 标题分节，超长节 200 行 part 分片），扫描页与图片走 ppocr-rs PP-OCRv6 OCR 兜底（hayro 2x 白底渲染）。**OCR 模型缓存 know-mcp 自持**（`KNOW_OCR_CACHE_DIR` 或 `%LOCALAPPDATA%/know-mcp/ocr-models`，不与 reader_rs 共享，不依赖 reader 二进制）
 - **嵌入**：`embed.rs` — Qwen3-Embedding-0.6B Q8_0 GGUF，llama-cpp-2（llama.cpp 原生内核），pooling=LAST + L2 归一。Query 侧用 instruct 模板，document 侧原文
 - **存储**：`zvec_store.rs` — zvec 引擎内融合：HNSW INT8 量化向量 + jieba FTS + RRF 重排
-- **增量索引**：`sync.rs` — 三段流水线（producer×N → GPU 嵌入 → 有序入库）；mtime+size 快路径 → 内容哈希 → 确定性 chunk id（`{locator}-{i}`）delete-then-upsert
+- **增量索引**：`sync.rs` — 三段流水线（producer×N → GPU 嵌入 → 有序入库）；mtime+size 快路径 → 内容哈希 → 确定性 chunk id（`{locator}-{i}`）delete-then-upsert；文档格式在 producer 内走抽取管线（`[reader]` 配置段控制）
 - **daemon**：herdr 模式（探测-拉起-等就绪）；`daemon.lock` 原子 create_new 单实例互斥 + PID 存活检测接管；stdio 桥首调用自动拉起 daemon
+- **CLI 动词形态**：`know-mcp register` 原生复制自身为 `know-cli`（同 mcp2cli Windows link 机制但内化，零外部依赖）；know-cli 按 exe 名（argv[0]）路由到动词形态（`get-status`/`search-content`/`read-file`/`build-index`/`manage-index` + `--json` 信封），直连 daemon 管理面
 
 ## 常用命令
 
@@ -24,9 +26,10 @@ bash scripts/build.sh release              # 发布构建（thin-LTO）
 ```
 
 - **任何 cargo 命令前必须 `source scripts/env.sh`**（CUDA 13.5 显式指定，系统 CUDA_PATH 指向 12.9 会炸 MSVC 14.44；Windows SDK LIB/INCLUDE/rc/mt 路径；详见文件内注释）
-- 模型文件：`D:/search-harness/workspace/models/hf_Qwen_Qwen3-Embedding-0.6B-Q8_0.gguf`（639,150,592 字节，`validate_gguf` 校验大小）
+- 模型文件：`models/hf_Qwen_Qwen3-Embedding-0.6B-Q8_0.gguf`（仓库内 gitignored，639,150,592 字节，`validate_gguf` 校验大小）
 - 配置查找顺序：`--config` > `KNOW_MCP_CONFIG` > exe 同目录 > 工作目录
 - Windows 优先 `dunce::canonicalize`（非 UNC 路径）
+- 冒烟语料在 `crates/know-core/tests/fixtures/corpus`（代码+文档+PDF，`know-mcp.toml` roots 指向这里）
 
 ## 项目禁令（clippy.toml disallowed-methods）
 
